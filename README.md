@@ -83,21 +83,21 @@ $env:DOTNET_CLI_TELEMETRY_OPTOUT = '1'
 
 ### 测试
 
-worker 测试必须预加载断网保护，在仓库根目录运行：
-
-```powershell
-runtime\node\node.exe --import ./worker/test/fixtures/offline-network.mjs --test --test-concurrency=2 worker/test/*.test.mjs
-```
-
-通过标准是输出末尾 `# fail 0`。
-
-Core 与界面测试：
+先跑 Core 与界面测试。它会顺带构建 worker 测试要启动的辅助程序 `tests\fixtures\CrashHarness`：
 
 ```powershell
 .tooling\dotnet\dotnet.exe test tests\UnifiedMediaHub.Tests
 ```
 
-通过标准是失败数为 0。所有测试都是离线的合成数据，不访问真实平台、不读取任何账号。
+通过标准是失败数为 0。
+
+再跑 worker 测试。必须预加载断网保护，在仓库根目录运行：
+
+```powershell
+runtime\node\node.exe --import ./worker/test/fixtures/offline-network.mjs --test --test-concurrency=2 worker/test/*.test.mjs
+```
+
+通过标准是输出末尾 `# fail 0`。所有测试都是离线的合成数据，不访问真实平台、不读取任何账号。
 
 ## 使用者责任与平台条款
 

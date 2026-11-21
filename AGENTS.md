@@ -42,21 +42,21 @@ Use the project-local tools, never global ones:
 
 ## Tests
 
-Worker tests must preload the offline-network guard. From the repository root:
-
-```powershell
-runtime\node\node.exe --import ./worker/test/fixtures/offline-network.mjs --test --test-concurrency=2 worker/test/*.test.mjs
-```
-
-Pass condition: `# fail 0`. Keep the `--import` when running a single file.
-
-Core and WPF tests:
+Run the Core and WPF tests first. Building them also builds `tests\fixtures\CrashHarness`, which some worker tests launch:
 
 ```powershell
 .tooling\dotnet\dotnet.exe test tests\UnifiedMediaHub.Tests
 ```
 
 Pass condition: zero failures.
+
+Then the worker tests. They must preload the offline-network guard. From the repository root:
+
+```powershell
+runtime\node\node.exe --import ./worker/test/fixtures/offline-network.mjs --test --test-concurrency=2 worker/test/*.test.mjs
+```
+
+Pass condition: `# fail 0`. Keep the `--import` when running a single file.
 
 All tests use synthetic data. Never add tests that contact a real platform, and never commit real account names, links, IDs, cookies or screenshots of real accounts.
 

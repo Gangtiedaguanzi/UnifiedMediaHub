@@ -221,15 +221,16 @@ function Ensure-Browser {
 }
 
 function Run-Tests {
-  Say '运行 worker 测试（离线）'
   Push-Location $project
   try {
-    $tests = @(Get-ChildItem -LiteralPath (In 'worker\test') -Filter '*.test.mjs' | ForEach-Object { 'worker/test/' + $_.Name })
-    & (In 'runtime\node\node.exe') --import ./worker/test/fixtures/offline-network.mjs --test --test-concurrency=2 @tests
-    if ($LASTEXITCODE -ne 0) { throw 'worker 测试未通过。' }
+    # Core first: building it also builds tests\fixtures\CrashHarness, which the worker process tests launch.
     Say '运行 Core 与界面测试'
     & (In '.tooling\dotnet\dotnet.exe') test (In 'tests\UnifiedMediaHub.Tests')
     if ($LASTEXITCODE -ne 0) { throw 'Core 测试未通过。' }
+    Say '运行 worker 测试（离线）'
+    $tests = @(Get-ChildItem -LiteralPath (In 'worker\test') -Filter '*.test.mjs' | ForEach-Object { 'worker/test/' + $_.Name })
+    & (In 'runtime\node\node.exe') --import ./worker/test/fixtures/offline-network.mjs --test --test-concurrency=2 @tests
+    if ($LASTEXITCODE -ne 0) { throw 'worker 测试未通过。' }
   } finally { Pop-Location }
 }
 
