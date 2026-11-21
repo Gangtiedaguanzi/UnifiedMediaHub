@@ -66,9 +66,13 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\setup.ps1
 
 ## 让 AI 助手代为安装
 
-可以让 Claude Code、ChatGPT 等能在你电脑上执行命令的 AI 助手代为安装。把下面这段话发给它：
+可以让 Claude Code、Codex、ChatGPT 等能在你电脑上执行命令的 AI 助手代为安装。把下面这段话发给它：
 
-> 请在我的 Windows 电脑上安装 https://github.com/Gangtiedaguanzi/UnifiedMediaHub 。先阅读仓库里的 AGENTS.md 和 docs/install.md，然后克隆仓库并运行 `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\setup.ps1 -RunTests`。不要替我登录任何账号，不要读取安装目录下的 data 文件夹。完成后告诉我快捷方式在哪里。
+> 请在我的 Windows 电脑上安装 https://github.com/Gangtiedaguanzi/UnifiedMediaHub 。先阅读仓库里的 AGENTS.md 和 docs/install.md，然后克隆仓库并运行 `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\setup.ps1 -RunTests`。不要替我登录任何账号，不要读取安装目录下的 data 文件夹。完成后告诉我快捷方式在哪里，再按 docs/getting-started.md 一步一步带我完成登录和抖音桥接配置。
+
+以后程序出了问题，可以对它说：
+
+> 统一媒体管理器出了问题：（把提示文字原样贴在这里）。请按仓库 AGENTS.md 里“When something goes wrong”一节排查和修复，修完跑两套测试并重新安装。不要读取 data 文件夹，需要诊断信息时让我从程序里导出脱敏报告。
 
 登录、扫码和输入密码都要你自己来做。
 
