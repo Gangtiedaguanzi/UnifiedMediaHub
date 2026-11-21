@@ -1,0 +1,12 @@
+{
+  "project": "https://github.com/iyear/tdl",
+  "tag": "v0.20.4",
+  "commit": "9d7d49eef2bcb04da720c26e33598c49c68b9ddd",
+  "archiveUrl": "https://codeload.github.com/iyear/tdl/zip/refs/tags/v0.20.4",
+  "archiveSha256": "B20F8A2DF424FEAE7978930F78D4B107E67BE1C6CCE880C31F39987713532916",
+  "forkVersion": "v0.20.4+umh.6",
+  "goVersion": "go1.27.3",
+  "goArchiveUrl": "https://go.dev/dl/go1.27.3.windows-amd64.zip",
+  "goArchiveSha256": "F26081F438319757F8A1B46D7D0B2C5EC7583D4038E485E0AA725CFDE7885FFF",
+  "goExeSha256": "83B7BA66215E696414FA49462D0DB2DA4F4CF15C7BEBD42F0B189FA04866999D"
+}

@@ -1,0 +1,65 @@
+{
+  "schemaVersion": 1,
+  "note": "Pinned third-party components fetched by scripts/setup.ps1. Every download is checked against sha256 before use.",
+  "dotnetSdk": {
+    "version": "10.0.402",
+    "file": "dotnet-sdk-10.0.402-win-x64.zip",
+    "urls": ["https://builds.dotnet.microsoft.com/dotnet/Sdk/10.0.402/dotnet-sdk-10.0.402-win-x64.zip"],
+    "sha256": "24d057ab968986a9d7c7a01606b2a0192cbe6485221ba38e9c685522e93d8798"
+  },
+  "node": {
+    "version": "22.23.3",
+    "file": "node-v22.23.3-win-x64.zip",
+    "urls": ["https://nodejs.org/dist/v22.23.3/node-v22.23.3-win-x64.zip"],
+    "sha256": "2b0ff57b049cda1bbcea2240eec20467018713c1efe1f7360c2681859b90ed71",
+    "folder": "node-v22.23.3-win-x64"
+  },
+  "galleryDl": {
+    "version": "1.32.20",
+    "release": "https://codeberg.org/mikf/gallery-dl/releases/tag/v1.32.20",
+    "exe": {
+      "file": "gallery-dl.exe",
+      "urls": ["https://codeberg.org/mikf/gallery-dl/releases/download/v1.32.20/gallery-dl.exe"],
+      "sha256": "e14e498e0d95a216b3019b4f899d813ebb322868052f4f0ecfa3a0600deb84b0"
+    },
+    "source": {
+      "file": "gallery_dl-1.32.20.tar.gz",
+      "urls": ["https://codeberg.org/mikf/gallery-dl/releases/download/v1.32.20/gallery_dl-1.32.20.tar.gz"],
+      "sha256": "335792dc3af065dd70ec2908f28e46a5653ff66e35a447326be620e990d7c0f3",
+      "licensePath": "gallery_dl-1.32.20/LICENSE",
+      "licenseSha256": "8177f97513213526df2cf6184d8ff986c675afb514d4e68a404010521b880643"
+    },
+    "sums": {
+      "file": "SHA256SUMS",
+      "urls": ["https://codeberg.org/mikf/gallery-dl/releases/download/v1.32.20/SHA256SUMS"],
+      "sha256": "2674221b1b7c96f66e40841e7b1026880cc05e946a6678cd746fa7bc071f587c"
+    }
+  },
+  "tdl": {
+    "version": "v0.20.4+umh.6",
+    "releaseRepository": "Gangtiedaguanzi/UnifiedMediaHub",
+    "releaseTag": "tdl-v0.20.4-umh.6",
+    "exe": {
+      "file": "tdl.exe",
+      "asset": "tdl-v0.20.4-umh.6-windows-amd64.exe",
+      "sha256": "038c481b43f90b243e10472d0d1a5792e9d71d33ae804dbc53114c6b67b5c173"
+    },
+    "source": {
+      "file": "tdl-v0.20.4+umh.6-source.zip",
+      "asset": "tdl-v0.20.4-umh.6-source.zip",
+      "sha256": "75c54127235cd501ca70730d584b93f3eb8083497e8e00afe073c12b58a0c8ac"
+    }
+  },
+  "go": {
+    "version": "1.27.3",
+    "file": "go1.27.3.windows-amd64.zip",
+    "urls": ["https://go.dev/dl/go1.27.3.windows-amd64.zip"],
+    "sha256": "f26081f438319757f8a1b46d7d0b2c5ec7583d4038e485e0aa725cfde7885fff"
+  },
+  "chromium": {
+    "playwright": "1.64.1",
+    "folder": "chromium-1248",
+    "chromeVersion": "156.0.8078.4",
+    "chromeExeSha256": "7f08161bbeb2853ffe1780a9ded4985087f52efb9725d7d8207aabdd42f7cfb9"
+  }
+}

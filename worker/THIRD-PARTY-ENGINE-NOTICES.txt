@@ -1,0 +1,47 @@
+UnifiedMediaHub worker engine and thumbnail notices
+
+Engines are external executables, launched only for explicit operations:
+- gallery-dl 1.32.20: https://codeberg.org/mikf/gallery-dl/releases/tag/v1.32.20
+  GPL-2.0-only, upstream Michael Fährmann and contributors. Preserve the bundled
+  LICENSE plus corresponding source/provenance from artifacts/third-party/gallery-dl.
+- tdl v0.20.4+umh.6: https://github.com/iyear/tdl/tree/v0.20.4
+  AGPL-3.0, upstream iyear and contributors. This is an explicitly modified build.
+  Ship runtime/engines/tdl/LICENSE, README-UMH.md and the complete matching
+  tdl-v0.20.4+umh.6-source.zip plus provenance/build instructions from
+  artifacts/third-party/tdl. The modified engine source and license are separate
+  from this Node adapter; never describe the fork as upstream byte-identical.
+
+Small Telegram stripped-thumbnail port:
+worker/src/shared/telegram-thumbnails.mjs and telegram-jpeg-header.mjs use the
+623-byte header/expansion from gotd/td v0.140.0 telegram/thumbnail/thumbnail.go:
+https://github.com/gotd/td/blob/v0.140.0/telegram/thumbnail/thumbnail.go
+The public 28-byte golden fixture is from the same version's thumbnail_test.go.
+Copyright (c) 2020 Aleksandr Razumov; MIT license reproduced below.
+
+The gotd implementation explicitly says "Based on tdesktop implementation":
+https://github.com/telegramdesktop/tdesktop/blob/v2.7.5/Telegram/SourceFiles/ui/image/image.cpp#L43
+The original Telegram Desktop implementation is GPL-3.0-or-later, Telegram
+Desktop contributors. Preserve this upstream attribution as well. The MIT
+package label alone is not a claim resolving inherited upstream licensing.
+This distribution must retain the engine source bundles and original notices.
+MIT License
+
+Copyright (c) 2020 Aleksandr Razumov
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.

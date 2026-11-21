@@ -1,0 +1,3871 @@
+diff --git a/app/chat/export.go b/app/chat/export.go
+index 5916959..4db0d78 100644
+--- a/app/chat/export.go
++++ b/app/chat/export.go
+@@ -5,6 +5,7 @@ import (
+ 	"encoding/json"
+ 	"fmt"
+ 	"os"
++	"strconv"
+ 	"time"
+ 
+ 	"github.com/expr-lang/expr"
+@@ -28,6 +29,8 @@ import (
+ //go:generate go-enum --names --values --flag --nocase
+ 
+ type ExportOptions struct {
++	PeerType    string
++	StrictPeer  bool
+ 	Type        ExportType
+ 	Chat        string
+ 	Thread      int // topic id in forum, message id in group
+@@ -75,11 +78,7 @@ func Export(ctx context.Context, c *telegram.Client, kvd storage.Storage, opts E
+ 	var peer peers.Peer
+ 
+ 	manager := peers.Options{Storage: storage.NewPeers(kvd)}.Build(c.API())
+-	if opts.Chat == "" { // defaults to me(saved messages)
+-		peer, err = manager.Self(ctx)
+-	} else {
+-		peer, err = tutil.GetInputPeer(ctx, manager, opts.Chat)
+-	}
++	peer, err = resolveExportPeer(ctx, manager, opts)
+ 	if err != nil {
+ 		return fmt.Errorf("failed to get peer: %w", err)
+ 	}
+@@ -129,6 +128,10 @@ func Export(ctx context.Context, c *telegram.Client, kvd storage.Storage, opts E
+ 	// process thread is reply type and peer is broadcast channel,
+ 	// so we need to set discussion group id instead of broadcast id
+ 	id := peer.ID()
++	kind := tutil.InputPeerType(peer.InputPeer())
++	if kind == "" {
++		return fmt.Errorf("unknown peer type")
++	}
+ 	if p, ok := peer.(peers.Channel); opts.Thread != 0 && ok && p.IsBroadcast() {
+ 		bc, _ := p.ToBroadcast()
+ 		raw, err := bc.FullRaw(ctx)
+@@ -139,11 +142,16 @@ func Export(ctx context.Context, c *telegram.Client, kvd storage.Storage, opts E
+ 		if id, ok = raw.GetLinkedChatID(); !ok {
+ 			return fmt.Errorf("no linked group")
+ 		}
++		linked, err := tutil.ResolveTyped(ctx, manager, "channel", strconv.FormatInt(id, 10))
++		if err != nil {
++			return err
++		}
++		kind = tutil.InputPeerType(linked.InputPeer())
+ 	}
+ 
+ 	enc.ObjStart()
+ 	defer enc.ObjEnd()
+-	enc.Field("id", func(e *jx.Encoder) { e.Int64(id) })
++	writeExportHeader(enc, id, kind)
+ 
+ 	enc.FieldStart("messages")
+ 	enc.ArrStart()
+@@ -173,6 +181,9 @@ loop:
+ 		if !ok {
+ 			continue
+ 		}
++		if tutil.GetPeerID(m.PeerID) != id || tutil.PeerKey(m.PeerID) != fmt.Sprintf("%s:%d", kind, id) {
++			return fmt.Errorf("export peer mismatch")
++		}
+ 		// only get media messages
+ 		media, ok := tmedia.GetMedia(m)
+ 		if !ok && !opts.All {
+diff --git a/app/chat/list_integrity_test.go b/app/chat/list_integrity_test.go
+new file mode 100644
+index 0000000..1195894
+--- /dev/null
++++ b/app/chat/list_integrity_test.go
+@@ -0,0 +1,171 @@
++package chat
++
++import (
++	"context"
++	"errors"
++	"github.com/gotd/td/bin"
++	"github.com/gotd/td/telegram"
++	"github.com/gotd/td/tg"
++	"github.com/gotd/td/tgerr"
++	"github.com/iyear/tdl/core/logctx"
++	"github.com/iyear/tdl/core/storage"
++	clientcore "github.com/iyear/tdl/core/tclient"
++	"go.uber.org/zap"
++	"testing"
++	"time"
++)
++
++type listMemory map[string][]byte
++
++func (m listMemory) Get(_ context.Context, k string) ([]byte, error) {
++	if b, ok := m[k]; ok {
++		return b, nil
++	}
++	return nil, storage.ErrNotFound
++}
++func (m listMemory) Set(_ context.Context, k string, v []byte) error { m[k] = v; return nil }
++func (m listMemory) Delete(_ context.Context, k string) error        { delete(m, k); return nil }
++func listResult(out bin.Decoder, value bin.Encoder) error {
++	var b bin.Buffer
++	if err := value.Encode(&b); err != nil {
++		return err
++	}
++	return out.Decode(&b)
++}
++func pageOfDialogs(n int) *tg.MessagesDialogsSlice {
++	p := &tg.MessagesDialogsSlice{Count: n + 1}
++	for i := 1; i <= n; i++ {
++		id := int64(i)
++		c := &tg.Channel{ID: id, Title: "synthetic", Photo: &tg.ChatPhotoEmpty{}}
++		c.SetAccessHash(id + 100)
++		p.Chats = append(p.Chats, c)
++		p.Dialogs = append(p.Dialogs, &tg.Dialog{Peer: &tg.PeerChannel{ChannelID: id}, TopMessage: 7})
++		p.Messages = append(p.Messages, &tg.Message{ID: 7, PeerID: &tg.PeerChannel{ChannelID: id}, Date: i + 1000})
++	}
++	// Deliberately shuffle duplicate message IDs: last array message is not last dialog.
++	p.Messages[0], p.Messages[n-1] = p.Messages[n-1], p.Messages[0]
++	return p
++}
++func TestDialogPaginationUsesPeerAndMessage(t *testing.T) {
++	ctx := logctx.With(context.Background(), zap.NewNop())
++	calls := 0
++	p := pageOfDialogs(100)
++	// Same numeric peer IDs across all three namespaces, plus MessageService.
++	p.Users = []tg.UserClass{&tg.User{ID: 1, AccessHash: 111}}
++	p.Chats = append(p.Chats, &tg.Chat{ID: 1, Title: "group", Photo: &tg.ChatPhotoEmpty{}})
++	p.Dialogs[0] = &tg.Dialog{Peer: &tg.PeerUser{UserID: 1}, TopMessage: 7}
++	p.Dialogs[1] = &tg.Dialog{Peer: &tg.PeerChat{ChatID: 1}, TopMessage: 7}
++	p.Messages = append(p.Messages, &tg.Message{ID: 7, PeerID: &tg.PeerUser{UserID: 1}, Date: 9001}, &tg.MessageService{ID: 7, PeerID: &tg.PeerChat{ChatID: 1}, Date: 9002, Action: &tg.MessageActionEmpty{}})
++	api := tg.NewClient(telegram.InvokeFunc(func(_ context.Context, in bin.Encoder, out bin.Decoder) error {
++		calls++
++		q := in.(*tg.MessagesGetDialogsRequest)
++		if calls == 1 {
++			return listResult(out, p)
++		}
++		if q.OffsetID != 7 || q.OffsetDate != 1100 || q.OffsetPeer.(*tg.InputPeerChannel).ChannelID != 100 || q.OffsetPeer.(*tg.InputPeerChannel).AccessHash != 200 {
++			t.Fatalf("wrong next RPC offset: %+v", q)
++		}
++		return listResult(out, &tg.MessagesDialogs{})
++	}))
++	rows, skipped, err := fetchDialogsWithErrorHandling(ctx, api)
++	if err != nil || skipped != 0 || len(rows) != 100 || calls != 2 {
++		t.Fatalf("rows=%d skipped=%d calls=%d err=%v", len(rows), skipped, calls, err)
++	}
++	if rows[0].Last.GetDate() != 9001 || rows[1].Last.GetDate() != 9002 || rows[2].Last.GetDate() != 1003 || rows[99].Last.GetDate() != 1100 {
++		t.Fatal("message identity collision")
++	}
++}
++func TestActualListTerminalBarrierStopsAllLaterRPC(t *testing.T) {
++	for _, phase := range []string{"first", "second", "blocked", "topic", "cancel"} {
++		t.Run(phase, func(t *testing.T) {
++			ctx, cancel := context.WithTimeout(logctx.With(context.Background(), zap.NewNop()), time.Second)
++			defer cancel()
++			calls := 0
++			terminal := error(tgerr.New(420, "FLOOD_WAIT_3600"))
++			if phase == "cancel" {
++				terminal = context.Canceled
++			}
++			var inv tg.Invoker = telegram.InvokeFunc(func(_ context.Context, in bin.Encoder, out bin.Decoder) error {
++				calls++
++				t.Logf("RPC %T", in)
++				switch q := in.(type) {
++				case *tg.MessagesGetDialogsRequest:
++					if phase == "cancel" {
++						cancel()
++						return terminal
++					}
++					if phase == "first" || phase == "second" && calls == 2 {
++						return terminal
++					}
++					n := 2
++					if phase == "second" {
++						n = 100
++					}
++					p := pageOfDialogs(n)
++					for _, c := range p.Chats {
++						c.(*tg.Channel).Forum = true
++					}
++					return listResult(out, p)
++				case *tg.ContactsGetBlockedRequest:
++					if phase == "blocked" {
++						return terminal
++					}
++					return listResult(out, &tg.ContactsBlocked{})
++				case *tg.MessagesGetForumTopicsRequest:
++					if phase != "topic" || q.Peer.(*tg.InputPeerChannel).ChannelID != 1 {
++						t.Fatal("unexpected later topic RPC")
++					}
++					return terminal
++				default:
++					t.Fatalf("unexpected RPC %T", in)
++					return nil
++				}
++			})
++			chain := clientcore.NewDefaultMiddlewares(ctx, time.Minute, true)
++			for i := len(chain) - 1; i >= 0; i-- {
++				inv = chain[i].Handle(inv)
++			}
++			err := listWithAPI(ctx, tg.NewClient(inv), listMemory{}, ListOptions{Filter: "true", Output: ListOutputJson})
++			expected := map[string]int{"first": 1, "second": 2, "blocked": 2, "topic": 4, "cancel": 1}[phase]
++			if err == nil || calls != expected || (phase != "cancel" && ctx.Err() != nil) {
++				t.Fatalf("barrier lost err=%v calls=%d", err, calls)
++			}
++			if phase == "cancel" {
++				if !errors.Is(err, context.Canceled) {
++					t.Fatal(err)
++				}
++			} else if !tgerr.Is(err, "FLOOD_WAIT") {
++				t.Fatal(err)
++			}
++		})
++	}
++}
++
++func TestMissingEntitySkipAndMissingFinalCursorAreDifferent(t *testing.T) {
++	for _, final := range []bool{false, true} {
++		t.Run(map[bool]string{false: "skipped row continues", true: "missing cursor fails"}[final], func(t *testing.T) {
++			p := pageOfDialogs(100)
++			index := 0
++			if final {
++				index = 99
++			}
++			p.Chats = append(p.Chats[:index], p.Chats[index+1:]...)
++			calls := 0
++			api := tg.NewClient(telegram.InvokeFunc(func(_ context.Context, _ bin.Encoder, out bin.Decoder) error {
++				calls++
++				if calls == 1 {
++					return listResult(out, p)
++				}
++				return listResult(out, &tg.MessagesDialogs{})
++			}))
++			rows, skipped, err := fetchDialogsWithErrorHandling(logctx.With(context.Background(), zap.NewNop()), api)
++			if final {
++				if err == nil || calls != 1 {
++					t.Fatal("missing final cursor certified success")
++				}
++			} else if err != nil || skipped != 1 || len(rows) != 99 || calls != 2 {
++				t.Fatalf("skip boundary: %d %d %d %v", len(rows), skipped, calls, err)
++			}
++		})
++	}
++}
+diff --git a/app/chat/ls.go b/app/chat/ls.go
+index 4e177bd..84e9319 100644
+--- a/app/chat/ls.go
++++ b/app/chat/ls.go
+@@ -8,7 +8,6 @@ import (
+ 	"strings"
+ 
+ 	"github.com/expr-lang/expr"
+-	"github.com/fatih/color"
+ 	"github.com/go-faster/errors"
+ 	"github.com/gotd/td/telegram"
+ 	"github.com/gotd/td/telegram/message/peer"
+@@ -27,6 +26,7 @@ import (
+ //go:generate go-enum --names --values --flag --nocase
+ 
+ type Dialog struct {
++	PeerType    string  `json:"peer_type"`
+ 	ID          int64   `json:"id" comment:"ID of dialog"`
+ 	Type        string  `json:"type" comment:"Type of dialog. Can be 'private', 'channel' or 'group'"`
+ 	VisibleName string  `json:"visible_name,omitempty" comment:"Title of channel and group, first and last name of user. If empty, output '-'"`
+@@ -57,6 +57,9 @@ type ListOptions struct {
+ }
+ 
+ func List(ctx context.Context, c *telegram.Client, kvd storage.Storage, opts ListOptions) error {
++	return listWithAPI(ctx, c.API(), kvd, opts)
++}
++func listWithAPI(ctx context.Context, api *tg.Client, kvd storage.Storage, opts ListOptions) error {
+ 	log := logctx.From(ctx)
+ 
+ 	// align output
+@@ -83,19 +86,22 @@ func List(ctx context.Context, c *telegram.Client, kvd storage.Storage, opts Lis
+ 	// Manually iterate through dialogs to handle errors gracefully
+ 	// This allows us to skip problematic dialogs (deleted/inaccessible channels)
+ 	// rather than failing completely when ExtractPeer fails
+-	dialogs, skipped := fetchDialogsWithErrorHandling(ctx, c.API())
++	dialogs, skipped, err := fetchDialogsWithErrorHandling(ctx, api)
++	if err != nil {
++		return err
++	}
+ 	if skipped > 0 {
+ 		log.Warn("skipped problematic dialogs during iteration",
+ 			zap.Int("skipped", skipped),
+ 			zap.Int("fetched", len(dialogs)))
+ 	}
+ 
+-	blocked, err := tutil.GetBlockedDialogs(ctx, c.API())
++	blocked, err := tutil.GetBlockedDialogs(ctx, api)
+ 	if err != nil {
+ 		return err
+ 	}
+ 
+-	manager := peers.Options{Storage: storage.NewPeers(kvd)}.Build(c.API())
++	manager := peers.Options{Storage: storage.NewPeers(kvd)}.Build(api)
+ 	result := make([]*Dialog, 0, len(dialogs))
+ 	for _, d := range dialogs {
+ 		id := tutil.GetInputPeerID(d.Peer)
+@@ -115,7 +121,10 @@ func List(ctx context.Context, c *telegram.Client, kvd storage.Storage, opts Lis
+ 		case *tg.InputPeerUser:
+ 			r = processUser(t.UserID, d.Entities)
+ 		case *tg.InputPeerChannel:
+-			r = processChannel(ctx, c.API(), t.ChannelID, d.Entities)
++			r, err = processChannel(ctx, api, t.ChannelID, d.Entities)
++			if err != nil {
++				return err
++			}
+ 		case *tg.InputPeerChat:
+ 			r = processChat(t.ChatID, d.Entities)
+ 		}
+@@ -202,6 +211,7 @@ func processUser(id int64, entities peer.Entities) *Dialog {
+ 
+ 	return &Dialog{
+ 		ID:          u.ID,
++		PeerType:    "user",
+ 		VisibleName: visibleName(u.FirstName, u.LastName),
+ 		Username:    u.Username,
+ 		Type:        DialogPrivate,
+@@ -209,14 +219,15 @@ func processUser(id int64, entities peer.Entities) *Dialog {
+ 	}
+ }
+ 
+-func processChannel(ctx context.Context, api *tg.Client, id int64, entities peer.Entities) *Dialog {
++func processChannel(ctx context.Context, api *tg.Client, id int64, entities peer.Entities) (*Dialog, error) {
+ 	c, ok := entities.Channel(id)
+ 	if !ok {
+-		return nil
++		return nil, nil
+ 	}
+ 
+ 	d := &Dialog{
+ 		ID:          c.ID,
++		PeerType:    "channel",
+ 		VisibleName: c.Title,
+ 		Username:    c.Username,
+ 	}
+@@ -234,17 +245,13 @@ func processChannel(ctx context.Context, api *tg.Client, id int64, entities peer
+ 	if c.Forum {
+ 		topics, err := fetchTopics(ctx, api, c.AsInputPeer())
+ 		if err != nil {
+-			logctx.From(ctx).Error("failed to fetch topics",
+-				zap.Int64("channel_id", c.ID),
+-				zap.String("channel_username", c.Username),
+-				zap.Error(err))
+-			return nil
++			return nil, err
+ 		}
+ 
+ 		d.Topics = topics
+ 	}
+ 
+-	return d
++	return d, nil
+ }
+ 
+ // fetchTopics https://github.com/telegramdesktop/tdesktop/blob/4047f1733decd5edf96d125589f128758b68d922/Telegram/SourceFiles/data/data_forum.cpp#L135
+@@ -263,7 +270,7 @@ func fetchTopics(ctx context.Context, api *tg.Client, peer tg.InputPeerClass) ([
+ 		if offsetTopic == lastOffsetTopic && lastOffsetTopic != -1 {
+ 			log.Warn("pagination stuck (same offset), breaking loop",
+ 				zap.Int("offset_topic", offsetTopic))
+-			break
++			return nil, fmt.Errorf("incomplete topic pagination")
+ 		}
+ 		if seenOffsets[offsetTopic] {
+ 			log.Warn("pagination cycle detected, breaking loop",
+@@ -340,6 +347,7 @@ func processChat(id int64, entities peer.Entities) *Dialog {
+ 
+ 	return &Dialog{
+ 		ID:          c.ID,
++		PeerType:    "chat",
+ 		VisibleName: c.Title,
+ 		Username:    "-",
+ 		Type:        DialogGroup,
+@@ -384,208 +392,101 @@ func applyPeers(ctx context.Context, manager *peers.Manager, entities peer.Entit
+ // to gracefully handle errors from problematic dialogs (deleted/inaccessible channels).
+ // Instead of failing completely when ExtractPeer fails in gotd's iterator, it logs errors
+ // and continues, skipping bad dialogs.
+-func fetchDialogsWithErrorHandling(ctx context.Context, api *tg.Client) ([]dialogs.Elem, int) {
+-	log := logctx.From(ctx)
++func fetchDialogsWithErrorHandling(ctx context.Context, api *tg.Client) ([]dialogs.Elem, int, error) {
+ 	const batchSize = 100
+-	var (
+-		allElems   []dialogs.Elem
+-		skipped    int
+-		offsetID   int
+-		offsetDate int
+-		offsetPeer tg.InputPeerClass = &tg.InputPeerEmpty{}
+-		seen                         = make(map[int64]bool) // Track seen dialog IDs to prevent duplicates
+-	)
+-
++	type messageKey struct {
++		peer string
++		id   int
++	}
++	var rows []dialogs.Elem
++	skipped, offsetID, offsetDate := 0, 0, 0
++	var offsetPeer tg.InputPeerClass = &tg.InputPeerEmpty{}
++	seen := map[string]bool{}
++	cursors := map[messageKey]bool{}
+ 	for {
+-		// Fetch a batch of dialogs using raw API
+-		result, err := api.MessagesGetDialogs(ctx, &tg.MessagesGetDialogsRequest{
+-			OffsetDate: offsetDate,
+-			OffsetID:   offsetID,
+-			OffsetPeer: offsetPeer,
+-			Limit:      batchSize,
+-		})
++		result, err := api.MessagesGetDialogs(ctx, &tg.MessagesGetDialogsRequest{OffsetDate: offsetDate, OffsetID: offsetID, OffsetPeer: offsetPeer, Limit: batchSize})
+ 		if err != nil {
+-			log.Error("failed to fetch dialog batch", zap.Error(err))
+-			break
++			return nil, skipped, fmt.Errorf("get dialogs: %w", err)
+ 		}
+-
+-		var (
+-			dialogsSlice []tg.DialogClass
+-			messages     []tg.MessageClass
+-			users        []tg.UserClass
+-			chats        []tg.ChatClass
+-		)
+-
+-		switch d := result.(type) {
++		var ds []tg.DialogClass
++		var ms []tg.MessageClass
++		var us []tg.UserClass
++		var cs []tg.ChatClass
++		switch r := result.(type) {
+ 		case *tg.MessagesDialogs:
+-			dialogsSlice = d.Dialogs
+-			messages = d.Messages
+-			users = d.Users
+-			chats = d.Chats
++			ds, ms, us, cs = r.Dialogs, r.Messages, r.Users, r.Chats
+ 		case *tg.MessagesDialogsSlice:
+-			dialogsSlice = d.Dialogs
+-			messages = d.Messages
+-			users = d.Users
+-			chats = d.Chats
+-		case *tg.MessagesDialogsNotModified:
+-			// No more dialogs
+-			return allElems, skipped
++			ds, ms, us, cs = r.Dialogs, r.Messages, r.Users, r.Chats
+ 		default:
+-			log.Error("unexpected dialog type", zap.String("type", fmt.Sprintf("%T", result)))
+-			return allElems, skipped
++			return nil, skipped, fmt.Errorf("unsupported dialogs response")
+ 		}
+-
+-		if len(dialogsSlice) == 0 {
+-			break
++		if len(ds) == 0 {
++			return rows, skipped, nil
+ 		}
+-
+-		// Build entities map for this batch
+-		// Convert slices to maps as required by peer.NewEntities
+-		userMap := make(map[int64]*tg.User)
+-		for _, u := range users {
+-			if user, ok := u.(*tg.User); ok {
+-				userMap[user.ID] = user
++		users := map[int64]*tg.User{}
++		chats := map[int64]*tg.Chat{}
++		channels := map[int64]*tg.Channel{}
++		for _, u := range us {
++			if x, ok := u.(*tg.User); ok {
++				users[x.ID] = x
+ 			}
+ 		}
+-
+-		chatMap := make(map[int64]*tg.Chat)
+-		channelMap := make(map[int64]*tg.Channel)
+-		for _, c := range chats {
+-			switch chat := c.(type) {
++		for _, c := range cs {
++			switch x := c.(type) {
+ 			case *tg.Chat:
+-				chatMap[chat.ID] = chat
++				chats[x.ID] = x
+ 			case *tg.Channel:
+-				channelMap[chat.ID] = chat
++				channels[x.ID] = x
+ 			}
+ 		}
+-
+-		entities := peer.NewEntities(userMap, chatMap, channelMap)
+-
+-		// Build message map for quick lookup by ID
+-		messageMap := make(map[int]tg.NotEmptyMessage)
+-		for _, msg := range messages {
+-			switch m := msg.(type) {
+-			case *tg.Message:
+-				messageMap[m.ID] = m
+-			case *tg.MessageService:
+-				messageMap[m.ID] = m
++		entities := peer.NewEntities(users, chats, channels)
++		messages := map[messageKey]tg.NotEmptyMessage{}
++		for _, m := range ms {
++			if x, ok := m.AsNotEmpty(); ok {
++				if key := tutil.PeerKey(x.GetPeerID()); key != "" {
++					messages[messageKey{key, x.GetID()}] = x
++				}
+ 			}
+ 		}
+-
+-		// Process each dialog in this batch
+-		for _, d := range dialogsSlice {
+-			dialog, ok := d.(*tg.Dialog)
++		for _, d := range ds {
++			x, ok := d.(*tg.Dialog)
+ 			if !ok {
++				skipped++
+ 				continue
+ 			}
+-
+-			// Find the peer ID for logging purposes
+-			var peerID int64
+-			switch p := dialog.Peer.(type) {
+-			case *tg.PeerUser:
+-				peerID = p.UserID
+-			case *tg.PeerChat:
+-				peerID = p.ChatID
+-			case *tg.PeerChannel:
+-				peerID = p.ChannelID
+-			default:
+-				log.Error("unknown peer type", zap.String("type", fmt.Sprintf("%T", p)))
++			key := tutil.PeerKey(x.Peer)
++			if key == "" {
+ 				skipped++
+ 				continue
+ 			}
+-
+-			// Skip if we've already seen this dialog (deduplication)
+-			if seen[peerID] {
++			if seen[key] {
+ 				continue
+ 			}
+-			seen[peerID] = true
+-
+-			// Try to extract the peer - THIS IS WHERE THE ORIGINAL ERROR OCCURS
+-			// In gotd's query/dialogs iterator, it calls ExtractPeer without error handling,
+-			// causing a panic when a channel doesn't exist in entities.
+-			// We catch it here and skip the problematic dialog instead.
+-			// See: https://github.com/iyear/tdl/issues/713
+-			inputPeer, err := entities.ExtractPeer(dialog.Peer)
++			seen[key] = true
++			input, err := entities.ExtractPeer(x.Peer)
+ 			if err != nil {
+-				// This dialog references a channel/chat that doesn't exist in entities
+-				// (likely deleted, user was banned, or channel is inaccessible).
+-				// Log and skip it instead of failing.
+-				log.Warn("skipping dialog with missing peer",
+-					zap.Int64("peer_id", peerID),
+-					zap.String("peer_type", fmt.Sprintf("%T", dialog.Peer)),
+-					zap.Error(err))
+ 				skipped++
+ 				continue
+ 			}
+-
+-			// Get the last message for this dialog from message map
+-			lastMsg := messageMap[dialog.TopMessage]
+-
+-			// Successfully processed this dialog
+-			allElems = append(allElems, dialogs.Elem{
+-				Peer:     inputPeer,
+-				Entities: entities,
+-				Dialog:   dialog,
+-				Last:     lastMsg,
+-			})
++			rows = append(rows, dialogs.Elem{Peer: input, Entities: entities, Dialog: x, Last: messages[messageKey{key, x.TopMessage}]})
+ 		}
+-
+-		// Update offset for next batch using the last dialog in dialogsSlice
+-		// (regardless of whether it was successfully processed or skipped)
+-		if len(dialogsSlice) > 0 {
+-			lastDialog, ok := dialogsSlice[len(dialogsSlice)-1].(*tg.Dialog)
+-			if ok {
+-				// Get the message date from message map
+-				var msgDate int
+-				if lastMsg, found := messageMap[lastDialog.TopMessage]; found {
+-					msgDate = lastMsg.GetDate()
+-				}
+-
+-				offsetDate = msgDate
+-				offsetID = lastDialog.TopMessage
+-
+-				// Set offset peer based on dialog peer type
+-				// Try to get access hash from entities if available
+-				switch peerType := lastDialog.Peer.(type) {
+-				case *tg.PeerUser:
+-					if user, ok := entities.User(peerType.UserID); ok {
+-						offsetPeer = &tg.InputPeerUser{
+-							UserID:     peerType.UserID,
+-							AccessHash: user.AccessHash,
+-						}
+-					} else {
+-						// Can't continue pagination without access hash
+-						log.Error("failed to get user for offset, stopping pagination",
+-							zap.Int64("user_id", peerType.UserID))
+-						color.Red("Error: failed to get user for offset, stopping pagination. User ID: %d", peerType.UserID)
+-						return allElems, skipped
+-					}
+-				case *tg.PeerChat:
+-					offsetPeer = &tg.InputPeerChat{ChatID: peerType.ChatID}
+-				case *tg.PeerChannel:
+-					if channel, ok := entities.Channel(peerType.ChannelID); ok {
+-						offsetPeer = &tg.InputPeerChannel{
+-							ChannelID:  peerType.ChannelID,
+-							AccessHash: channel.AccessHash,
+-						}
+-					} else {
+-						// Can't continue pagination without access hash
+-						log.Error("failed to get channel for offset, stopping pagination",
+-							zap.Int64("channel_id", peerType.ChannelID))
+-						color.Red("Error: failed to get channel for offset, stopping pagination. Channel ID: %d", peerType.ChannelID)
+-						return allElems, skipped
+-					}
+-				}
+-			}
++		if len(ds) < batchSize {
++			return rows, skipped, nil
+ 		}
+-
+-		// Check if we've fetched all dialogs
+-		// Continue fetching if we got a full batch (there might be more)
+-		if len(dialogsSlice) < batchSize {
+-			// Got less than requested, we've reached the end
+-			break
++		last, ok := ds[len(ds)-1].(*tg.Dialog)
++		if !ok {
++			return nil, skipped, fmt.Errorf("incomplete dialog cursor")
+ 		}
++		key := messageKey{tutil.PeerKey(last.Peer), last.TopMessage}
++		msg := messages[key]
++		if key.peer == "" || key.id <= 0 || msg == nil || msg.GetDate() <= 0 || cursors[key] {
++			return nil, skipped, fmt.Errorf("incomplete dialog cursor")
++		}
++		cursors[key] = true
++		input, err := entities.ExtractPeer(last.Peer)
++		if err != nil {
++			return nil, skipped, fmt.Errorf("incomplete dialog peer: %w", err)
++		}
++		offsetPeer, offsetID, offsetDate = input, last.TopMessage, msg.GetDate()
+ 	}
+-
+-	return allElems, skipped
+ }
+diff --git a/app/chat/machine_list.go b/app/chat/machine_list.go
+new file mode 100644
+index 0000000..1c9c1a1
+--- /dev/null
++++ b/app/chat/machine_list.go
+@@ -0,0 +1,351 @@
++// Bounded UMH directory projection; legacy chat ls remains unchanged.
++package chat
++
++import (
++	"context"
++	"encoding/json"
++	"errors"
++	"io"
++	"regexp"
++	"strconv"
++	"strings"
++	"unicode"
++	"unicode/utf8"
++
++	"github.com/gotd/td/tg"
++	"github.com/gotd/td/tgerr"
++	"github.com/iyear/tdl/core/umh"
++)
++
++type MachineChat struct {
++	PeerType string `json:"peer_type"`
++	ID       string `json:"id"`
++	Title    string `json:"title"`
++	Username string `json:"username,omitempty"`
++}
++
++type MachineChats struct {
++	Version        int           `json:"version"`
++	Type           string        `json:"type"`
++	Limit          int           `json:"limit"`
++	ResponseKind   string        `json:"responseKind"`
++	Chats          []MachineChat `json:"chats"`
++	SkippedCount   int           `json:"skippedCount"`
++	DuplicateCount int           `json:"duplicateCount"`
++	Truncated      bool          `json:"truncated"`
++	Completeness   string        `json:"completeness"`
++}
++
++// MachineMaxLimit bounds one directory read across the main list and archive.
++const MachineMaxLimit = 5000
++
++// machineDialogBatch is the per-request page size (Telegram's maximum).
++const machineDialogBatch = 100
++
++var errMachineDialogs = errors.New("invalid dialog response")
++var machineUsername = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_]{0,63}$`)
++
++// machineFolders are read in order: the main list, then the archive folder.
++var machineFolders = []int{0, 1}
++
++type machineEntity struct {
++	title, username string
++	available       bool
++}
++
++type machineCursor struct {
++	peer string
++	id   int
++}
++
++type machineNext struct {
++	key  machineCursor
++	peer tg.InputPeerClass
++	date int
++}
++
++// MachineList pages through the main dialog list and then the archive folder
++// until `limit` chats are projected or both lists end. It makes no blocked-list,
++// topic, resolver or peer-cache calls. Of the returned messages only the date of
++// each page's last top message is read, to build the next page's cursor; message
++// content is never read or projected. A FLOOD_WAIT after at least one page ends
++// the read early with a partial (truncated) result instead of discarding it.
++func MachineList(ctx context.Context, api *tg.Client, limit int, w io.Writer) error {
++	if limit < 1 || limit > MachineMaxLimit {
++		return umh.ErrInput
++	}
++	if err := ctx.Err(); err != nil {
++		return err
++	}
++	r := MachineChats{Version: 1, Type: "chats", Limit: limit, Chats: []MachineChat{}, Completeness: "partial", ResponseKind: "full"}
++	seen := map[string]bool{}
++	pages := 0
++folders:
++	for _, folder := range machineFolders {
++		offsetDate, offsetID := 0, 0
++		var offsetPeer tg.InputPeerClass = &tg.InputPeerEmpty{}
++		cursors := map[machineCursor]bool{}
++		for {
++			if len(r.Chats) >= limit {
++				// More dialogs may exist; stop paging rather than reading past the bound.
++				r.Truncated = true
++				r.ResponseKind = "slice"
++				break folders
++			}
++			req := &tg.MessagesGetDialogsRequest{OffsetDate: offsetDate, OffsetID: offsetID, OffsetPeer: offsetPeer, Limit: machineDialogBatch}
++			if folder != 0 {
++				req.SetFolderID(folder)
++			}
++			raw, err := api.MessagesGetDialogs(ctx, req)
++			if err != nil {
++				if _, flood := tgerr.AsFloodWait(err); flood && pages > 0 {
++					r.Truncated = true
++					r.ResponseKind = "slice"
++					break folders
++				}
++				return err
++			}
++			if err := ctx.Err(); err != nil {
++				return err
++			}
++			pages++
++			next, done, err := machineProjectPage(ctx, raw, limit, seen, &r)
++			if err != nil {
++				return err
++			}
++			if done {
++				break
++			}
++			if cursors[next.key] {
++				return errMachineDialogs
++			}
++			cursors[next.key] = true
++			offsetPeer, offsetID, offsetDate = next.peer, next.key.id, next.date
++		}
++	}
++	if r.ResponseKind == "full" && r.SkippedCount == 0 && r.DuplicateCount == 0 && !r.Truncated {
++		r.Completeness = "complete"
++	}
++	data, err := json.Marshal(r)
++	if err != nil {
++		return err
++	}
++	if err := ctx.Err(); err != nil {
++		return err
++	}
++	// Nothing reaches stdout until the entire response has passed validation.
++	data = append(data, '\n')
++	n, err := w.Write(data)
++	if err == nil && n != len(data) {
++		return io.ErrShortWrite
++	}
++	return err
++}
++
++func machinePeerKey(p tg.PeerClass) (string, int64, bool) {
++	switch v := p.(type) {
++	case *tg.PeerUser:
++		if v == nil {
++			return "", 0, false
++		}
++		return "user", v.UserID, true
++	case *tg.PeerChat:
++		if v == nil {
++			return "", 0, false
++		}
++		return "chat", v.ChatID, true
++	case *tg.PeerChannel:
++		if v == nil {
++			return "", 0, false
++		}
++		return "channel", v.ChannelID, true
++	}
++	return "", 0, false
++}
++
++// machineProjectPage validates one whole page, appends its chats to r and
++// returns the next page's cursor, or done when this folder has no more pages.
++func machineProjectPage(ctx context.Context, raw tg.MessagesDialogsClass, limit int, seen map[string]bool, r *MachineChats) (machineNext, bool, error) {
++	var none machineNext
++	var dialogs []tg.DialogClass
++	var users []tg.UserClass
++	var chats []tg.ChatClass
++	var messages []tg.MessageClass
++	last := false
++	switch p := raw.(type) {
++	case *tg.MessagesDialogs:
++		if p == nil {
++			return none, false, errMachineDialogs
++		}
++		// A full (non-slice) response carries every dialog of this folder.
++		last = true
++		dialogs, users, chats, messages = p.Dialogs, p.Users, p.Chats, p.Messages
++	case *tg.MessagesDialogsSlice:
++		if p == nil || p.Count < 0 {
++			return none, false, errMachineDialogs
++		}
++		dialogs, users, chats, messages = p.Dialogs, p.Users, p.Chats, p.Messages
++	default:
++		return none, false, errMachineDialogs
++	}
++	entities := map[string]machineEntity{}
++	inputs := map[string]tg.InputPeerClass{}
++	add := func(kind string, id int64, title, username string, available bool, input tg.InputPeerClass) error {
++		if id <= 0 || !utf8.ValidString(title) || !utf8.ValidString(username) {
++			return errMachineDialogs
++		}
++		key := kind + "_" + strconv.FormatInt(id, 10)
++		e := machineEntity{title, username, available}
++		if prior, ok := entities[key]; ok && prior != e {
++			return errMachineDialogs
++		}
++		entities[key] = e
++		inputs[key] = input
++		return nil
++	}
++	var err error
++	for _, value := range users {
++		if err := ctx.Err(); err != nil {
++			return none, false, err
++		}
++		switch u := value.(type) {
++		case *tg.User:
++			if u == nil {
++				return none, false, errMachineDialogs
++			}
++			err = add("user", u.ID, visibleName(u.FirstName, u.LastName), u.Username, !u.Deleted, &tg.InputPeerUser{UserID: u.ID, AccessHash: u.AccessHash})
++		case *tg.UserEmpty:
++			if u == nil {
++				return none, false, errMachineDialogs
++			}
++			err = add("user", u.ID, "", "", false, &tg.InputPeerUser{UserID: u.ID})
++		default:
++			return none, false, errMachineDialogs
++		}
++		if err != nil {
++			return none, false, err
++		}
++	}
++	for _, value := range chats {
++		if err := ctx.Err(); err != nil {
++			return none, false, err
++		}
++		switch c := value.(type) {
++		case *tg.Chat:
++			if c == nil {
++				return none, false, errMachineDialogs
++			}
++			err = add("chat", c.ID, c.Title, "", !c.Deactivated, &tg.InputPeerChat{ChatID: c.ID})
++		case *tg.Channel:
++			if c == nil {
++				return none, false, errMachineDialogs
++			}
++			err = add("channel", c.ID, c.Title, c.Username, true, &tg.InputPeerChannel{ChannelID: c.ID, AccessHash: c.AccessHash})
++		case *tg.ChatEmpty:
++			if c == nil {
++				return none, false, errMachineDialogs
++			}
++			err = add("chat", c.ID, "", "", false, &tg.InputPeerChat{ChatID: c.ID})
++		case *tg.ChatForbidden:
++			if c == nil {
++				return none, false, errMachineDialogs
++			}
++			err = add("chat", c.ID, "", "", false, &tg.InputPeerChat{ChatID: c.ID})
++		case *tg.ChannelForbidden:
++			if c == nil {
++				return none, false, errMachineDialogs
++			}
++			err = add("channel", c.ID, "", "", false, &tg.InputPeerChannel{ChannelID: c.ID, AccessHash: c.AccessHash})
++		default:
++			return none, false, errMachineDialogs
++		}
++		if err != nil {
++			return none, false, err
++		}
++	}
++	var lastDialog *tg.Dialog
++	var lastKey string
++	for _, value := range dialogs {
++		if err := ctx.Err(); err != nil {
++			return none, false, err
++		}
++		if folder, ok := value.(*tg.DialogFolder); ok {
++			// The archive entry of the main list; its chats are read as their own folder.
++			if folder == nil {
++				return none, false, errMachineDialogs
++			}
++			continue
++		}
++		d, ok := value.(*tg.Dialog)
++		if !ok || d == nil {
++			return none, false, errMachineDialogs
++		}
++		kind, id, ok := machinePeerKey(d.Peer)
++		if !ok || id <= 0 {
++			return none, false, errMachineDialogs
++		}
++		textID := strconv.FormatInt(id, 10)
++		key := kind + "_" + textID
++		lastDialog, lastKey = d, key
++		if seen[key] {
++			r.DuplicateCount++
++			continue
++		}
++		seen[key] = true
++		e, ok := entities[key]
++		if !ok || !e.available {
++			r.SkippedCount++
++			continue
++		}
++		// Still validate every later row of this page: reaching the limit never exits this loop.
++		if len(r.Chats) >= limit {
++			r.Truncated = true
++			r.ResponseKind = "slice"
++			continue
++		}
++		title := make([]rune, 0, 500)
++		for _, c := range strings.TrimSpace(e.title) {
++			if !unicode.IsControl(c) {
++				title = append(title, c)
++			}
++			if len(title) == 500 {
++				break
++			}
++		}
++		label := strings.TrimSpace(string(title))
++		if label == "" {
++			label = key
++		}
++		row := MachineChat{PeerType: kind, ID: textID, Title: label}
++		if machineUsername.MatchString(e.username) {
++			row.Username = e.username
++		}
++		r.Chats = append(r.Chats, row)
++	}
++	if last || len(dialogs) < machineDialogBatch {
++		return none, true, nil
++	}
++	if lastDialog == nil || lastDialog.TopMessage <= 0 {
++		return none, false, errMachineDialogs
++	}
++	input, ok := inputs[lastKey]
++	if !ok {
++		return none, false, errMachineDialogs
++	}
++	cursor := machineCursor{lastKey, lastDialog.TopMessage}
++	date := 0
++	for _, m := range messages {
++		x, ok := m.AsNotEmpty()
++		if !ok || x.GetID() != cursor.id {
++			continue
++		}
++		if kind, id, ok := machinePeerKey(x.GetPeerID()); ok && kind+"_"+strconv.FormatInt(id, 10) == lastKey {
++			date = x.GetDate()
++			break
++		}
++	}
++	if date <= 0 {
++		return none, false, errMachineDialogs
++	}
++	return machineNext{key: cursor, peer: input, date: date}, false, nil
++}
+diff --git a/app/chat/machine_list_test.go b/app/chat/machine_list_test.go
+new file mode 100644
+index 0000000..5ed7456
+--- /dev/null
++++ b/app/chat/machine_list_test.go
+@@ -0,0 +1,366 @@
++package chat
++
++import (
++	"bytes"
++	"context"
++	"encoding/json"
++	"errors"
++	"io"
++	"strconv"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/gotd/td/bin"
++	"github.com/gotd/td/telegram"
++	"github.com/gotd/td/tg"
++	"github.com/gotd/td/tgerr"
++	"github.com/iyear/tdl/core/umh"
++)
++
++func machinePage() *tg.MessagesDialogs {
++	return &tg.MessagesDialogs{
++		Dialogs: []tg.DialogClass{
++			&tg.Dialog{Peer: &tg.PeerUser{UserID: 7}},
++			&tg.Dialog{Peer: &tg.PeerChat{ChatID: 7}},
++			&tg.Dialog{Peer: &tg.PeerChannel{ChannelID: 7}},
++		},
++		Users: []tg.UserClass{&tg.User{ID: 7, FirstName: "name\n", LastName: "person", Phone: "PRIVATE_PHONE"}},
++		Chats: []tg.ChatClass{
++			&tg.Chat{ID: 7, Title: "group", Photo: &tg.ChatPhotoEmpty{}},
++			&tg.Channel{ID: 7, Title: "forum", Username: "valid_name", Forum: true, Photo: &tg.ChatPhotoEmpty{}},
++		},
++		Messages: []tg.MessageClass{&tg.Message{ID: 9, PeerID: &tg.PeerUser{UserID: 7}, Message: "PRIVATE_MESSAGE"}},
++	}
++}
++
++// machineAPI serves `result` as the whole main list and an empty archive folder.
++func machineAPI(t *testing.T, result tg.MessagesDialogsClass, calls *int) *tg.Client {
++	t.Helper()
++	return tg.NewClient(telegram.InvokeFunc(func(_ context.Context, in bin.Encoder, out bin.Decoder) error {
++		*calls++
++		q, ok := in.(*tg.MessagesGetDialogsRequest)
++		if !ok || *calls > 2 {
++			t.Fatalf("unexpected RPC %T, calls=%d", in, *calls)
++		}
++		if q.Limit != machineDialogBatch || q.OffsetDate != 0 || q.OffsetID != 0 || q.Hash != 0 || q.ExcludePinned {
++			t.Fatal("wrong initial request")
++		}
++		if _, ok := q.OffsetPeer.(*tg.InputPeerEmpty); !ok {
++			t.Fatal("not an initial page")
++		}
++		folder, hasFolder := q.GetFolderID()
++		if *calls == 1 && hasFolder {
++			t.Fatal("main list must not be folder restricted")
++		}
++		if *calls == 2 {
++			if !hasFolder || folder != 1 {
++				t.Fatal("second request must read the archive folder")
++			}
++			return listResult(out, &tg.MessagesDialogs{})
++		}
++		return listResult(out, result)
++	}))
++}
++
++// machinePagedPage builds a slice page of users first..first+n-1, each with a
++// top message whose date decreases with the user ID.
++func machinePagedPage(first, n int) *tg.MessagesDialogsSlice {
++	p := &tg.MessagesDialogsSlice{Count: 100000}
++	for i := first; i < first+n; i++ {
++		id := int64(i)
++		p.Dialogs = append(p.Dialogs, &tg.Dialog{Peer: &tg.PeerUser{UserID: id}, TopMessage: 1000 + i})
++		p.Users = append(p.Users, &tg.User{ID: id, FirstName: "user", LastName: strconv.Itoa(i), AccessHash: id * 31})
++		p.Messages = append(p.Messages, &tg.Message{ID: 1000 + i, PeerID: &tg.PeerUser{UserID: id}, Date: 2000000 - i, Message: "PRIVATE_MESSAGE"})
++	}
++	return p
++}
++
++type machineStep struct {
++	folder int
++	result tg.MessagesDialogsClass
++	err    error
++}
++
++// machineScript serves each step in order and records the requests made.
++func machineScript(t *testing.T, steps []machineStep, reqs *[]*tg.MessagesGetDialogsRequest) *tg.Client {
++	t.Helper()
++	return tg.NewClient(telegram.InvokeFunc(func(_ context.Context, in bin.Encoder, out bin.Decoder) error {
++		q, ok := in.(*tg.MessagesGetDialogsRequest)
++		if !ok || len(*reqs) >= len(steps) {
++			t.Fatalf("unexpected RPC %T after %d requests", in, len(*reqs))
++		}
++		step := steps[len(*reqs)]
++		*reqs = append(*reqs, q)
++		folder, hasFolder := q.GetFolderID()
++		if (step.folder == 0 && hasFolder) || (step.folder != 0 && (!hasFolder || folder != step.folder)) {
++			t.Fatalf("request %d read the wrong folder", len(*reqs))
++		}
++		if step.err != nil {
++			return step.err
++		}
++		return listResult(out, step.result)
++	}))
++}
++
++func runMachine(t *testing.T, api *tg.Client, limit int) MachineChats {
++	t.Helper()
++	var out bytes.Buffer
++	if err := MachineList(context.Background(), api, limit, &out); err != nil {
++		t.Fatal(err)
++	}
++	var r MachineChats
++	if err := json.Unmarshal(out.Bytes(), &r); err != nil {
++		t.Fatal(err)
++	}
++	return r
++}
++
++func TestMachineListPagesMainListThenArchive(t *testing.T) {
++	var reqs []*tg.MessagesGetDialogsRequest
++	archive := machinePagedPage(500, 5)
++	r := runMachine(t, machineScript(t, []machineStep{
++		{0, machinePagedPage(1, 100), nil},
++		{0, machinePagedPage(101, 30), nil},
++		{1, archive, nil},
++	}, &reqs), 5000)
++	if len(r.Chats) != 135 || r.Completeness != "complete" || r.Truncated || r.ResponseKind != "full" {
++		t.Fatalf("wrong paged result: %d chats, %+v", len(r.Chats), r)
++	}
++	if r.Chats[134].ID != "504" || r.Chats[0].Title != "user 1" {
++		t.Fatal("archived chats or order lost")
++	}
++	next := reqs[1]
++	peer, ok := next.OffsetPeer.(*tg.InputPeerUser)
++	if !ok || peer.UserID != 100 || peer.AccessHash != 100*31 || next.OffsetID != 1100 || next.OffsetDate != 2000000-100 {
++		t.Fatalf("cursor not taken from the page's last dialog: %+v", next)
++	}
++	if _, ok := reqs[2].OffsetPeer.(*tg.InputPeerEmpty); !ok || reqs[2].OffsetID != 0 {
++		t.Fatal("archive folder must start from its first page")
++	}
++}
++
++func TestMachineListStopsPagingAtLimit(t *testing.T) {
++	var reqs []*tg.MessagesGetDialogsRequest
++	r := runMachine(t, machineScript(t, []machineStep{
++		{0, machinePagedPage(1, 100), nil},
++		{0, machinePagedPage(101, 100), nil},
++	}, &reqs), 150)
++	if len(reqs) != 2 || len(r.Chats) != 150 || !r.Truncated || r.Completeness != "partial" || r.ResponseKind != "slice" {
++		t.Fatalf("limit not enforced across pages: %d requests, %+v", len(reqs), r)
++	}
++}
++
++func TestMachineListFloodAfterFirstPageReturnsPartial(t *testing.T) {
++	var reqs []*tg.MessagesGetDialogsRequest
++	r := runMachine(t, machineScript(t, []machineStep{
++		{0, machinePagedPage(1, 100), nil},
++		{0, nil, tgerr.New(420, "FLOOD_WAIT_30")},
++	}, &reqs), 5000)
++	if len(r.Chats) != 100 || !r.Truncated || r.Completeness != "partial" {
++		t.Fatalf("partial result lost on flood wait: %+v", r)
++	}
++}
++
++func TestMachineListRejectsBrokenCursor(t *testing.T) {
++	for _, bad := range []string{"repeated", "missing_date", "missing_entity"} {
++		t.Run(bad, func(t *testing.T) {
++			var reqs []*tg.MessagesGetDialogsRequest
++			first := machinePagedPage(1, 100)
++			steps := []machineStep{{0, first, nil}}
++			switch bad {
++			case "repeated":
++				steps = append(steps, machineStep{0, machinePagedPage(1, 100), nil})
++			case "missing_date":
++				first.Messages = first.Messages[:99]
++			case "missing_entity":
++				first.Users = first.Users[:99]
++			}
++			var out bytes.Buffer
++			if err := MachineList(context.Background(), machineScript(t, steps, &reqs), 5000, &out); err == nil || out.Len() != 0 {
++				t.Fatal("broken cursor accepted")
++			}
++		})
++	}
++}
++
++func TestMachineListSinglePageBoundedAndPrivate(t *testing.T) {
++	calls := 0
++	var out bytes.Buffer
++	if err := MachineList(context.Background(), machineAPI(t, machinePage(), &calls), 2, &out); err != nil {
++		t.Fatal(err)
++	}
++	var r MachineChats
++	if err := json.Unmarshal(out.Bytes(), &r); err != nil {
++		t.Fatal(err)
++	}
++	if calls != 1 || len(r.Chats) != 2 || !r.Truncated || r.Completeness != "partial" || r.ResponseKind != "slice" || r.DuplicateCount != 0 || r.SkippedCount != 0 {
++		t.Fatalf("wrong bounded result: %+v", r)
++	}
++	if r.Chats[0].ID != "7" || r.Chats[0].PeerType != "user" || r.Chats[1].PeerType != "chat" {
++		t.Fatal("typed peers collapsed")
++	}
++	for _, secret := range []string{"PRIVATE", "topics", "access_hash", "messages", "phone", "offset", "\"forum\""} {
++		if strings.Contains(out.String(), secret) {
++			t.Fatalf("output contains forbidden field/content %s", secret)
++		}
++	}
++	if strings.Count(out.String(), "\n") != 1 || strings.Contains(r.Chats[0].Title, "\n") {
++		t.Fatal("not one sanitized record")
++	}
++}
++
++func TestMachineListCompleteness(t *testing.T) {
++	for _, kind := range []string{"full", "empty_full", "slice", "empty_slice", "missing", "duplicate", "unavailable", "folder"} {
++		t.Run(kind, func(t *testing.T) {
++			p := machinePage()
++			var result tg.MessagesDialogsClass = p
++			want, skipped, duplicates := "partial", 0, 0
++			switch kind {
++			case "full":
++				want = "complete"
++			case "empty_full":
++				result = &tg.MessagesDialogs{}
++				want = "complete"
++			case "slice":
++				// A short slice is the folder's last page.
++				result = &tg.MessagesDialogsSlice{Count: 3, Dialogs: p.Dialogs, Users: p.Users, Chats: p.Chats}
++				want = "complete"
++			case "empty_slice":
++				result = &tg.MessagesDialogsSlice{Count: 0}
++				want = "complete"
++			case "missing":
++				p.Users = nil
++				skipped = 1
++			case "duplicate":
++				p.Dialogs = append(p.Dialogs, p.Dialogs[0])
++				duplicates = 1
++			case "unavailable":
++				p.Users = []tg.UserClass{&tg.UserEmpty{ID: 7}}
++				skipped = 1
++			case "folder":
++				// The archive entry is read as its own folder, not skipped.
++				p.Dialogs = append(p.Dialogs, &tg.DialogFolder{Folder: tg.Folder{ID: 1, Title: "archive"}, Peer: &tg.PeerUser{UserID: 7}})
++				want = "complete"
++			}
++			calls := 0
++			var out bytes.Buffer
++			if err := MachineList(context.Background(), machineAPI(t, result, &calls), 10, &out); err != nil {
++				t.Fatal(err)
++			}
++			var r MachineChats
++			if err := json.Unmarshal(out.Bytes(), &r); err != nil {
++				t.Fatal(err)
++			}
++			if r.Completeness != want || r.SkippedCount != skipped || r.DuplicateCount != duplicates || r.Truncated {
++				t.Fatalf("wrong proof %+v", r)
++			}
++		})
++	}
++}
++
++func TestMachineListValidatesEntireResponseBeforeOutput(t *testing.T) {
++	for _, bad := range []string{"later_bad_id", "later_bad_entity", "conflict", "not_modified", "negative_count"} {
++		t.Run(bad, func(t *testing.T) {
++			p := machinePage()
++			var result tg.MessagesDialogsClass = p
++			switch bad {
++			case "later_bad_id":
++				p.Dialogs = append(p.Dialogs, &tg.Dialog{Peer: &tg.PeerUser{UserID: -1}})
++			case "later_bad_entity":
++				p.Users = append(p.Users, &tg.User{ID: 0})
++			case "conflict":
++				p.Chats = append(p.Chats, &tg.Channel{ID: 7, Title: "different", Photo: &tg.ChatPhotoEmpty{}})
++			case "not_modified":
++				result = &tg.MessagesDialogsNotModified{Count: 5}
++			case "negative_count":
++				result = &tg.MessagesDialogsSlice{Count: -1}
++			}
++			calls := 0
++			var out bytes.Buffer
++			if err := MachineList(context.Background(), machineAPI(t, result, &calls), 1, &out); err == nil || out.Len() != 0 {
++				t.Fatal("invalid trailing response partially published")
++			}
++		})
++	}
++}
++
++func TestMachineListInvalidLimitAndPreCancelMakeNoRPC(t *testing.T) {
++	for _, limit := range []int{-1, 0, MachineMaxLimit + 1} {
++		if err := MachineList(context.Background(), nil, limit, io.Discard); !errors.Is(err, umh.ErrInput) {
++			t.Fatalf("limit not rejected: %v", err)
++		}
++	}
++	ctx, cancel := context.WithCancel(context.Background())
++	cancel()
++	if err := MachineList(ctx, nil, 1, io.Discard); !errors.Is(err, context.Canceled) {
++		t.Fatal(err)
++	}
++}
++
++func TestMachineListTerminalErrorsAndLateCancelPublishNothing(t *testing.T) {
++	for _, kind := range []string{"flood", "deadline", "cancel_after_response"} {
++		t.Run(kind, func(t *testing.T) {
++			ctx, cancel := context.WithCancel(context.Background())
++			defer cancel()
++			calls := 0
++			var out bytes.Buffer
++			api := tg.NewClient(telegram.InvokeFunc(func(_ context.Context, _ bin.Encoder, dst bin.Decoder) error {
++				calls++
++				switch kind {
++				case "flood":
++					return tgerr.New(420, "FLOOD_WAIT_3600")
++				case "deadline":
++					return context.DeadlineExceeded
++				default:
++					cancel()
++					return listResult(dst, machinePage())
++				}
++			}))
++			err := MachineList(ctx, api, 3, &out)
++			if err == nil || calls != 1 || out.Len() != 0 {
++				t.Fatal("terminal barrier lost")
++			}
++			if kind == "flood" && !tgerr.Is(err, "FLOOD_WAIT") {
++				t.Fatal("flood changed")
++			}
++			if kind == "deadline" && !errors.Is(err, context.DeadlineExceeded) {
++				t.Fatal("timeout changed")
++			}
++			if kind == "cancel_after_response" && !errors.Is(err, context.Canceled) {
++				t.Fatal("cancel changed")
++			}
++		})
++	}
++}
++
++type failMachineWriter struct{}
++
++func (failMachineWriter) Write([]byte) (int, error) { return 0, io.ErrClosedPipe }
++
++func TestMachineListMetadataBoundsAndWriterFailure(t *testing.T) {
++	p := machinePage()
++	p.Chats[1].(*tg.Channel).Title = strings.Repeat("中", 600) + "\x00"
++	p.Chats[1].(*tg.Channel).Username = "PRIVATE/INVALID"
++	calls := 0
++	var out bytes.Buffer
++	if err := MachineList(context.Background(), machineAPI(t, p, &calls), 3, &out); err != nil {
++		t.Fatal(err)
++	}
++	var r MachineChats
++	if err := json.Unmarshal(out.Bytes(), &r); err != nil {
++		t.Fatal(err)
++	}
++	if len([]rune(r.Chats[2].Title)) != 500 || r.Chats[2].Username != "" {
++		t.Fatal("unbounded metadata")
++	}
++	calls = 0
++	if err := MachineList(context.Background(), machineAPI(t, p, &calls), 3, failMachineWriter{}); !errors.Is(err, io.ErrClosedPipe) {
++		t.Fatal("writer failure swallowed")
++	}
++	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
++	defer cancel()
++	if err := MachineList(ctx, nil, 1, io.Discard); !errors.Is(err, context.DeadlineExceeded) {
++		t.Fatal("pre deadline ignored")
++	}
++}
+diff --git a/app/chat/selector.go b/app/chat/selector.go
+new file mode 100644
+index 0000000..1488927
+--- /dev/null
++++ b/app/chat/selector.go
+@@ -0,0 +1,52 @@
++// UMH additions to tdl v0.20.4; licensed under the upstream AGPL-3.0.
++package chat
++
++import (
++	"context"
++	"github.com/go-faster/jx"
++	"github.com/gotd/td/telegram/peers"
++	"github.com/iyear/tdl/core/umh"
++	"github.com/iyear/tdl/core/util/tutil"
++)
++
++func resolveExportPeer(ctx context.Context, m *peers.Manager, o ExportOptions) (peers.Peer, error) {
++	if o.StrictPeer || o.PeerType != "" {
++		return resolveStrictExport(ctx, m, o)
++	}
++	if o.Chat == "" {
++		return m.Self(ctx)
++	}
++	return tutil.GetInputPeer(ctx, m, o.Chat)
++}
++
++type exportResolver interface {
++	tutil.TypedResolver
++	Resolve(context.Context, string) (peers.Peer, error)
++}
++
++func resolveStrictExport(ctx context.Context, m exportResolver, o ExportOptions) (peers.Peer, error) {
++	if o.PeerType != "" {
++		return tutil.ResolveTyped(ctx, m, o.PeerType, o.Chat)
++	}
++	{
++		if o.Chat == "" {
++			return nil, umh.ErrInput
++		}
++		c := o.Chat[0]
++		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '@') {
++			return nil, umh.ErrInput
++		}
++		p, e := m.Resolve(ctx, o.Chat)
++		if e != nil {
++			return nil, e
++		}
++		if !umh.Kind(tutil.InputPeerType(p.InputPeer())) || p.ID() <= 0 {
++			return nil, umh.ErrInput
++		}
++		return p, nil
++	}
++}
++func writeExportHeader(enc *jx.Encoder, id int64, kind string) {
++	enc.Field("id", func(e *jx.Encoder) { e.Int64(id) })
++	enc.Field("peer_type", func(e *jx.Encoder) { e.Str(kind) })
++}
+diff --git a/app/chat/typed_test.go b/app/chat/typed_test.go
+new file mode 100644
+index 0000000..877712e
+--- /dev/null
++++ b/app/chat/typed_test.go
+@@ -0,0 +1,98 @@
++package chat
++
++import (
++	"bytes"
++	"context"
++	"encoding/json"
++	"github.com/go-faster/jx"
++	"github.com/gotd/td/telegram/message/peer"
++	"github.com/gotd/td/telegram/peers"
++	"github.com/gotd/td/tg"
++	"github.com/iyear/tdl/core/util/tutil"
++	"testing"
++)
++
++type exportFake struct {
++	m     *peers.Manager
++	calls []string
++}
++
++func (f *exportFake) ResolveUserID(c context.Context, id int64) (peers.User, error) {
++	f.calls = append(f.calls, "user")
++	return f.m.User(&tg.User{ID: id}), nil
++}
++func (f *exportFake) ResolveChatID(c context.Context, id int64) (peers.Chat, error) {
++	f.calls = append(f.calls, "chat")
++	return f.m.Chat(&tg.Chat{ID: id}), nil
++}
++func (f *exportFake) ResolveChannelID(c context.Context, id int64) (peers.Channel, error) {
++	f.calls = append(f.calls, "channel")
++	return f.m.Channel(&tg.Channel{ID: id}), nil
++}
++func (f *exportFake) Resolve(c context.Context, name string) (peers.Peer, error) {
++	f.calls = append(f.calls, "name")
++	return f.m.Channel(&tg.Channel{ID: 7}), nil
++}
++func TestStrictSelector(t *testing.T) {
++	f := &exportFake{m: peers.Options{}.Build(nil)}
++	for _, o := range []ExportOptions{{StrictPeer: true}, {StrictPeer: true, Chat: "7"}, {StrictPeer: true, Chat: "-1007"}, {Chat: "7", PeerType: "unknown"}, {Chat: "name", PeerType: "channel"}} {
++		if _, e := resolveStrictExport(context.Background(), f, o); e == nil || len(f.calls) != 0 {
++			t.Fatal("invalid selector touched resolver")
++		}
++	}
++	p, e := resolveStrictExport(context.Background(), f, ExportOptions{StrictPeer: true, Chat: "publicName"})
++	if e != nil || p.ID() != 7 || tutil.InputPeerType(p.InputPeer()) != "channel" || len(f.calls) != 1 || f.calls[0] != "name" {
++		t.Fatal("public type lost")
++	}
++}
++
++func TestTypedListCollisions(t *testing.T) {
++	e := peer.NewEntities(map[int64]*tg.User{7: {ID: 7}}, map[int64]*tg.Chat{7: {ID: 7}}, map[int64]*tg.Channel{7: {ID: 7, Megagroup: true}})
++	channel, err := processChannel(context.Background(), nil, 7, e)
++	if err != nil {
++		t.Fatal(err)
++	}
++	rows := []*Dialog{processUser(7, e), processChat(7, e), channel}
++	for i, k := range []string{"user", "chat", "channel"} {
++		if rows[i] == nil || rows[i].PeerType != k {
++			t.Fatal("lost namespace")
++		}
++	}
++	keys := map[string]bool{}
++	for _, p := range []tg.PeerClass{&tg.PeerUser{UserID: 7}, &tg.PeerChat{ChatID: 7}, &tg.PeerChannel{ChannelID: 7}} {
++		keys[tutil.PeerKey(p)] = true
++	}
++	if len(keys) != 3 {
++		t.Fatal("collision")
++	}
++	b, _ := json.Marshal(rows)
++	if !json.Valid(b) {
++		t.Fatal("invalid JSON")
++	}
++}
++func TestTypedExportRootEvenEmpty(t *testing.T) {
++	for _, kind := range []string{"user", "chat", "channel"} {
++		for _, nonempty := range []bool{false, true} {
++			var b bytes.Buffer
++			e := jx.NewStreamingEncoder(&b, 512)
++			e.ObjStart()
++			writeExportHeader(e, 9007199254740993, kind)
++			e.FieldStart("messages")
++			e.ArrStart()
++			if nonempty {
++				e.Raw([]byte(`{"id":7}`))
++			}
++			e.ArrEnd()
++			e.ObjEnd()
++			e.Close()
++			var v struct {
++				ID       json.Number       `json:"id"`
++				PeerType string            `json:"peer_type"`
++				Messages []json.RawMessage `json:"messages"`
++			}
++			if json.Unmarshal(b.Bytes(), &v) != nil || v.ID.String() != "9007199254740993" || v.PeerType != kind || len(v.Messages) != map[bool]int{false: 0, true: 1}[nonempty] {
++				t.Fatal("lost export identity")
++			}
++		}
++	}
++}
+diff --git a/app/dl/dl.go b/app/dl/dl.go
+index 5200274..3bbff21 100644
+--- a/app/dl/dl.go
++++ b/app/dl/dl.go
+@@ -27,6 +27,7 @@ import (
+ )
+ 
+ type Options struct {
++	StrictPeer bool
+ 	Dir        string
+ 	RewriteExt bool
+ 	SkipSame   bool
+@@ -55,12 +56,16 @@ type parser struct {
+ func Run(ctx context.Context, c *telegram.Client, kvd storage.Storage, opts Options) (rerr error) {
+ 	pool := dcpool.NewPool(c,
+ 		int64(viper.GetInt(consts.FlagPoolSize)),
+-		tclient.NewDefaultMiddlewares(ctx, viper.GetDuration(consts.FlagReconnectTimeout))...)
++		poolMiddlewares(ctx)...)
+ 	defer multierr.AppendInvoke(&rerr, multierr.Close(pool))
+ 
++	fileParser := tmessage.FromFile(ctx, pool, kvd, opts.Files, true)
++	if opts.StrictPeer {
++		fileParser = tmessage.FromStrictFile(ctx, pool, kvd, opts.Files)
++	}
+ 	parsers := []parser{
+ 		{Data: opts.URLs, Parser: tmessage.FromURL(ctx, pool, kvd, opts.URLs)},
+-		{Data: opts.Files, Parser: tmessage.FromFile(ctx, pool, kvd, opts.Files, true)},
++		{Data: opts.Files, Parser: fileParser},
+ 	}
+ 	dialogs, err := collectDialogs(parsers)
+ 	if err != nil {
+@@ -142,6 +147,11 @@ func Run(ctx context.Context, c *telegram.Client, kvd storage.Storage, opts Opti
+ 	return downloader.New(options).Download(ctx, limit)
+ }
+ 
++// Pool invokers need the same explicit flood policy as the main client.
++func poolMiddlewares(ctx context.Context) []telegram.Middleware {
++	return tclient.NewDefaultMiddlewares(ctx, viper.GetDuration(consts.FlagReconnectTimeout), viper.GetBool(consts.FlagFailOnFloodWait))
++}
++
+ func collectDialogs(parsers []parser) ([][]*tmessage.Dialog, error) {
+ 	var dialogs [][]*tmessage.Dialog
+ 	for _, p := range parsers {
+diff --git a/app/dl/flood_policy_test.go b/app/dl/flood_policy_test.go
+new file mode 100644
+index 0000000..3445680
+--- /dev/null
++++ b/app/dl/flood_policy_test.go
+@@ -0,0 +1,43 @@
++package dl
++
++import (
++	"context"
++	"errors"
++	"github.com/gotd/td/bin"
++	"github.com/gotd/td/telegram"
++	"github.com/gotd/td/tg"
++	"github.com/gotd/td/tgerr"
++	"github.com/spf13/viper"
++	"testing"
++	"time"
++)
++
++func TestDownloadPoolFloodPolicy(t *testing.T) {
++	prior := viper.GetBool("fail-on-flood-wait")
++	defer viper.Set("fail-on-flood-wait", prior)
++	for _, failFast := range []bool{false, true} {
++		viper.Set("fail-on-flood-wait", failFast)
++		ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
++		calls := 0
++		var invoker tg.Invoker = telegram.InvokeFunc(func(context.Context, bin.Encoder, bin.Decoder) error {
++			calls++
++			return tgerr.New(420, "FLOOD_WAIT_3600")
++		})
++		chain := poolMiddlewares(ctx)
++		for i := len(chain) - 1; i >= 0; i-- {
++			invoker = chain[i].Handle(invoker)
++		}
++		err := invoker.Invoke(ctx, nil, nil)
++		if calls != 1 {
++			t.Fatalf("pool retried %d calls", calls)
++		}
++		if failFast {
++			if !tgerr.Is(err, "FLOOD_WAIT") || ctx.Err() != nil {
++				t.Fatal("pool lost immediate flood error")
++			}
++		} else if !errors.Is(err, context.DeadlineExceeded) {
++			t.Fatal("legacy pool policy changed")
++		}
++		cancel()
++	}
++}
+diff --git a/app/login/flood_policy_test.go b/app/login/flood_policy_test.go
+new file mode 100644
+index 0000000..9ed617b
+--- /dev/null
++++ b/app/login/flood_policy_test.go
+@@ -0,0 +1,52 @@
++package login
++
++import (
++	"bytes"
++	"context"
++	"encoding/json"
++	"testing"
++	"time"
++
++	"github.com/gotd/td/bin"
++	"github.com/gotd/td/telegram"
++	"github.com/gotd/td/telegram/auth"
++	"github.com/gotd/td/tg"
++	"github.com/gotd/td/tgerr"
++	"go.uber.org/zap"
++
++	"github.com/iyear/tdl/core/logctx"
++	clientcore "github.com/iyear/tdl/core/tclient"
++)
++
++type floodAccount struct{ invoker tg.Invoker }
++
++func (f floodAccount) Status(ctx context.Context) (*auth.Status, error) {
++	return nil, f.invoker.Invoke(ctx, nil, nil)
++}
++func (f floodAccount) Self(context.Context) (*tg.User, error) {
++	panic("Self must not follow failed authorization")
++}
++
++func TestMachineFloodWaitProductionChain(t *testing.T) {
++	ctx, cancel := context.WithTimeout(logctx.With(context.Background(), zap.NewNop()), 50*time.Millisecond)
++	defer cancel()
++	calls := 0
++	var invoker tg.Invoker = telegram.InvokeFunc(func(context.Context, bin.Encoder, bin.Decoder) error {
++		calls++
++		return tgerr.New(420, "FLOOD_WAIT_3600")
++	})
++	chain := clientcore.NewDefaultMiddlewares(ctx, time.Minute, true)
++	for i := len(chain) - 1; i >= 0; i-- {
++		invoker = chain[i].Handle(invoker)
++	}
++	var output bytes.Buffer
++	err := MachineIdentity(ctx, floodAccount{invoker}, &output)
++	if err == nil || output.Len() != 0 {
++		t.Fatal("failed RPC emitted an account")
++	}
++	MachineError(&output, err)
++	var event map[string]any
++	if json.Unmarshal(output.Bytes(), &event) != nil || event["code"] != "rate_limited" || calls != 1 || ctx.Err() != nil {
++		t.Fatalf("production chain swallowed flood cause: code=%v calls=%d expired=%v", event["code"], calls, ctx.Err() != nil)
++	}
++}
+diff --git a/app/login/machine.go b/app/login/machine.go
+new file mode 100644
+index 0000000..6b0ac80
+--- /dev/null
++++ b/app/login/machine.go
+@@ -0,0 +1,205 @@
++// UMH additions to tdl v0.20.4; licensed under the upstream AGPL-3.0.
++package login
++
++import (
++	"context"
++	"encoding/json"
++	"errors"
++	"github.com/gotd/td/telegram/auth"
++	"github.com/gotd/td/tg"
++	"github.com/gotd/td/tgerr"
++	"github.com/iyear/tdl/core/umh"
++	"io"
++	"net"
++	"strconv"
++	"strings"
++	"time"
++)
++
++var ErrUnauthorized = errors.New("unauthorized")
++
++type AccountClient interface {
++	Status(context.Context) (*auth.Status, error)
++	Self(context.Context) (*tg.User, error)
++}
++type LoginClient interface {
++	AccountClient
++	SendCode(context.Context, string, auth.SendCodeOptions) (tg.AuthSentCodeClass, error)
++	ResendCode(context.Context, string, string) (tg.AuthSentCodeClass, error)
++	SignIn(context.Context, string, string, string) (*tg.AuthAuthorization, error)
++	Password(context.Context, string) (*tg.AuthAuthorization, error)
++}
++
++func fmtID(id int64) string { return strconv.FormatInt(id, 10) }
++func MachineIdentity(ctx context.Context, c AccountClient, w io.Writer) error {
++	return machineIdentity(ctx, c, w, 0)
++}
++func machineIdentity(ctx context.Context, c AccountClient, w io.Writer, expectedID int64) error {
++	status, e := c.Status(ctx)
++	if e != nil {
++		return e
++	}
++	if status == nil || !status.Authorized {
++		return ErrUnauthorized
++	}
++	u, e := c.Self(ctx)
++	if e != nil {
++		return e
++	}
++	if u == nil || u.ID <= 0 || (expectedID > 0 && u.ID != expectedID) || (status.User != nil && status.User.ID != u.ID) {
++		return ErrUnauthorized
++	}
++	// Display name is optional. Omit it to keep untrusted account text out of diagnostics.
++	return json.NewEncoder(w).Encode(map[string]any{"version": 1, "type": "account", "authenticated": true, "accountId": fmtID(u.ID)})
++}
++
++var ErrDeliveryUnsupported = errors.New("delivery_unsupported")
++var ErrResendUnavailable = errors.New("resend_unavailable")
++
++func delivery(s *tg.AuthSentCode, remaining int) (umh.Delivery, error) {
++	d := umh.Delivery{ResendsRemaining: remaining}
++	switch s.Type.(type) {
++	case *tg.AuthSentCodeTypeApp:
++		d.Method = "app"
++	case *tg.AuthSentCodeTypeSMS:
++		d.Method = "sms"
++	case *tg.AuthSentCodeTypeCall:
++		d.Method = "call"
++	default:
++		return d, ErrDeliveryUnsupported
++	}
++	next, hasNext := s.GetNextType()
++	if hasNext {
++		switch next.(type) {
++		case *tg.AuthCodeTypeSMS:
++			d.NextMethod = "sms"
++		case *tg.AuthCodeTypeCall:
++			d.NextMethod = "call"
++		default:
++			d.NextMethod = "unsupported"
++		}
++	}
++	if seconds, ok := s.GetTimeout(); ok && seconds >= 0 && seconds <= 600 {
++		d.TimeoutSeconds = &seconds
++	}
++	return d, nil
++}
++func MachineLogin(ctx context.Context, c LoginClient, in io.ReadCloser, out io.Writer) error {
++	ctx, cancel := context.WithTimeout(ctx, 10*time.Minute)
++	defer cancel()
++	p := umh.NewPipe(in, out)
++	defer p.Close()
++	state, err := c.Status(ctx)
++	if err != nil {
++		return err
++	}
++	if state != nil && state.Authorized {
++		return MachineIdentity(ctx, c, out)
++	}
++	phone, err := p.Ask(ctx, "phone")
++	if err != nil {
++		return err
++	}
++	if err = ctx.Err(); err != nil {
++		return err
++	}
++	sent, err := c.SendCode(ctx, phone, auth.SendCodeOptions{})
++	if err != nil {
++		return err
++	}
++	for resends := 0; ; {
++		if err = ctx.Err(); err != nil {
++			return err
++		}
++		switch s := sent.(type) {
++		case *tg.AuthSentCodeSuccess:
++			if _, ok := s.Authorization.(*tg.AuthAuthorization); !ok {
++				return ErrDeliveryUnsupported
++			}
++			return MachineIdentity(ctx, c, out)
++		case *tg.AuthSentCode:
++			if s.PhoneCodeHash == "" {
++				return ErrUnauthorized
++			}
++			d, err := delivery(s, 3-resends)
++			if err != nil {
++				return err
++			}
++			received := time.Now()
++			reply, err := p.AskCode(ctx, d)
++			if err != nil {
++				return err
++			}
++			if err = ctx.Err(); err != nil {
++				return err
++			}
++			if reply.Resend {
++				if resends >= 3 || d.TimeoutSeconds == nil || d.NextMethod == "" || d.NextMethod == "unsupported" || time.Since(received) < time.Duration(*d.TimeoutSeconds)*time.Second {
++					return ErrResendUnavailable
++				}
++				resends++
++				sent, err = c.ResendCode(ctx, phone, s.PhoneCodeHash)
++				if err != nil {
++					return err
++				}
++				continue
++			}
++			_, err = c.SignIn(ctx, phone, reply.Text, s.PhoneCodeHash)
++			if errors.Is(err, auth.ErrPasswordAuthNeeded) {
++				password, e := p.Ask(ctx, "password")
++				if e != nil {
++					return e
++				}
++				if e = ctx.Err(); e != nil {
++					return e
++				}
++				_, err = c.Password(ctx, password)
++			}
++			if err != nil {
++				return err
++			}
++			return MachineIdentity(ctx, c, out)
++		default:
++			return ErrDeliveryUnsupported
++		}
++	}
++}
++func ErrorCode(e error) string {
++	if errors.Is(e, ErrQRExpired) || tgerr.Is(e, "AUTH_TOKEN_EXPIRED", "AUTH_TOKEN_INVALID", "AUTH_TOKEN_ALREADY_ACCEPTED") {
++		return "qr_expired"
++	}
++	if errors.Is(e, ErrDeliveryUnsupported) {
++		return "delivery_unsupported"
++	}
++	if errors.Is(e, ErrResendUnavailable) {
++		return "resend_unavailable"
++	}
++	if errors.Is(e, context.Canceled) {
++		return "cancelled"
++	}
++	if errors.Is(e, context.DeadlineExceeded) {
++		return "timeout"
++	}
++	if errors.Is(e, umh.ErrInput) || errors.Is(e, io.EOF) {
++		return "invalid_input"
++	}
++	if errors.Is(e, ErrUnauthorized) || auth.IsUnauthorized(e) {
++		return "unauthorized"
++	}
++	if r, ok := tgerr.As(e); ok {
++		if strings.HasPrefix(r.Type, "FLOOD_") {
++			return "rate_limited"
++		}
++		if strings.HasPrefix(r.Type, "PHONE_") || strings.HasPrefix(r.Type, "PASSWORD_") || strings.HasPrefix(r.Type, "SESSION_") {
++			return "auth_failed"
++		}
++	}
++	var n net.Error
++	if errors.As(e, &n) {
++		return "network_error"
++	}
++	return "operation_failed"
++}
++func MachineError(w io.Writer, e error) error {
++	return json.NewEncoder(w).Encode(map[string]any{"version": 1, "type": "error", "code": ErrorCode(e)})
++}
+diff --git a/app/login/machine_qr.go b/app/login/machine_qr.go
+new file mode 100644
+index 0000000..cf9b03e
+--- /dev/null
++++ b/app/login/machine_qr.go
+@@ -0,0 +1,139 @@
++// UMH additions to tdl v0.20.4; licensed under the upstream AGPL-3.0.
++package login
++
++import (
++	"context"
++	"encoding/base64"
++	"encoding/json"
++	"errors"
++	"github.com/gotd/td/clock"
++	"github.com/gotd/td/telegram/auth"
++	"github.com/gotd/td/telegram/auth/qrlogin"
++	"github.com/gotd/td/tg"
++	"github.com/gotd/td/tgerr"
++	"github.com/iyear/tdl/core/umh"
++	"github.com/skip2/go-qrcode"
++	"io"
++	"time"
++)
++
++var ErrQRExpired = errors.New("qr_expired")
++
++type QRLoginClient interface {
++	AccountClient
++	Export(context.Context, ...int64) (qrlogin.Token, error)
++	Import(context.Context) (*tg.AuthAuthorization, error)
++	Password(context.Context, string) (*tg.AuthAuthorization, error)
++}
++
++// Register before constructing/running the client: a phone approval can arrive
++// during Export or while stdout is still rendering. Duplicate updates coalesce.
++func BufferedLoginToken(d interface{ OnLoginToken(tg.LoginTokenHandler) }) <-chan struct{} {
++	ch := make(chan struct{}, 1)
++	d.OnLoginToken(func(ctx context.Context, _ tg.Entities, _ *tg.UpdateLoginToken) error {
++		if ctx.Err() != nil {
++			return ctx.Err()
++		}
++		select {
++		case ch <- struct{}{}:
++		default:
++		}
++		return nil
++	})
++	return ch
++}
++func MachineQRLogin(ctx context.Context, c QRLoginClient, in io.ReadCloser, out io.Writer, updates <-chan struct{}) error {
++	return machineQRLogin(ctx, c, in, out, updates, clock.System)
++}
++func machineQRLogin(ctx context.Context, c QRLoginClient, in io.ReadCloser, out io.Writer, updates <-chan struct{}, clk clock.Clock) error {
++	ctx, cancel := context.WithTimeout(ctx, 10*time.Minute)
++	defer cancel()
++	p := umh.NewWatchingPipe(in, out)
++	defer p.Close()
++	if err := ctx.Err(); err != nil {
++		return err
++	}
++	state, err := c.Status(ctx)
++	if err != nil {
++		return err
++	}
++	if state != nil && state.Authorized {
++		return MachineIdentity(ctx, c, out)
++	}
++	token, err := c.Export(ctx)
++	if err != nil {
++		return err
++	}
++	if err = ctx.Err(); err != nil {
++		return err
++	}
++	if token.Empty() {
++		return MachineIdentity(ctx, c, out)
++	}
++	remaining := token.Expires().Sub(clk.Now())
++	if remaining <= 0 {
++		return ErrQRExpired
++	}
++	if remaining > 600*time.Second {
++		return ErrUnauthorized
++	}
++	png, err := qrcode.Encode(token.URL(), qrcode.Medium, 320)
++	if err != nil || len(png) > 32768 {
++		return ErrUnauthorized
++	}
++	expires := token.Expires()
++	token = qrlogin.Token{}
++	if err = json.NewEncoder(out).Encode(map[string]any{"version": 1, "type": "qr", "pngBase64": base64.StdEncoding.EncodeToString(png), "expiresAtUnix": expires.Unix()}); err != nil {
++		return err
++	}
++	png = nil
++	timer := clk.Timer(expires.Sub(clk.Now()))
++	defer clock.StopTimer(timer)
++	select {
++	case <-ctx.Done():
++		return ctx.Err()
++	case <-p.Ended():
++		return io.EOF
++	case <-timer.C():
++		return ErrQRExpired
++	case <-updates:
++	}
++	if err = ctx.Err(); err != nil {
++		return err
++	}
++	if !clk.Now().Before(expires) {
++		return ErrQRExpired
++	}
++	select {
++	case <-p.Ended():
++		return io.EOF
++	default:
++	}
++	authorization, err := c.Import(ctx)
++	if errors.Is(err, auth.ErrPasswordAuthNeeded) || tgerr.Is(err, "SESSION_PASSWORD_NEEDED") {
++		password, e := p.Ask(ctx, "password")
++		if e != nil {
++			return e
++		}
++		if e = ctx.Err(); e != nil {
++			return e
++		}
++		authorization, err = c.Password(ctx, password)
++		password = ""
++	}
++	if err != nil {
++		return err
++	}
++	if err = ctx.Err(); err != nil {
++		return err
++	}
++	var expected int64
++	if authorization != nil && authorization.User != nil {
++		u, ok := authorization.User.(*tg.User)
++		if !ok || u.ID <= 0 {
++			return ErrUnauthorized
++		}
++		expected = u.ID
++	}
++	return machineIdentity(ctx, c, out, expected)
++}
+diff --git a/app/login/machine_qr_test.go b/app/login/machine_qr_test.go
+new file mode 100644
+index 0000000..78dddff
+--- /dev/null
++++ b/app/login/machine_qr_test.go
+@@ -0,0 +1,299 @@
++package login
++
++import (
++	"bytes"
++	"context"
++	"encoding/json"
++	"errors"
++	"github.com/gotd/neo"
++	tdclock "github.com/gotd/td/clock"
++	"github.com/gotd/td/telegram/auth"
++	"github.com/gotd/td/telegram/auth/qrlogin"
++	"github.com/gotd/td/tg"
++	"github.com/gotd/td/tgerr"
++	"github.com/gotd/td/tgmock"
++	"io"
++	"strings"
++	"testing"
++	"time"
++)
++
++type qrFake struct {
++	fakeAccount
++	exports, imports, passwords int
++	token                       qrlogin.Token
++	err                         error
++	updates                     chan struct{}
++	afterExport                 func()
++	verified                    bool
++}
++
++func (f *qrFake) Export(context.Context, ...int64) (qrlogin.Token, error) {
++	f.exports++
++	if f.afterExport != nil {
++		f.afterExport()
++	}
++	return f.token, nil
++}
++func (f *qrFake) Import(context.Context) (*tg.AuthAuthorization, error) {
++	f.imports++
++	if f.err != nil {
++		return nil, f.err
++	}
++	f.authorized = f.verified
++	return &tg.AuthAuthorization{}, nil
++}
++func (f *qrFake) Password(context.Context, string) (*tg.AuthAuthorization, error) {
++	f.passwords++
++	f.authorized = true
++	return &tg.AuthAuthorization{}, nil
++}
++func qrFixture() (*qrFake, *io.PipeReader, *io.PipeWriter) {
++	r, w := io.Pipe()
++	return &qrFake{fakeAccount: fakeAccount{id: 42}, token: qrlogin.NewToken([]byte("SYNTHETIC-QR-ONLY"), int(time.Now().Add(time.Minute).Unix())), updates: make(chan struct{}, 1), verified: true}, r, w
++}
++func TestMachineQRBufferedEarlyApproval(t *testing.T) {
++	f, r, w := qrFixture()
++	defer w.Close()
++	f.afterExport = func() { f.updates <- struct{}{} }
++	var out bytes.Buffer
++	err := MachineQRLogin(context.Background(), f, r, &out, f.updates)
++	if err != nil || f.exports != 1 || f.imports != 1 || !strings.Contains(out.String(), `"type":"account"`) {
++		t.Fatalf("one-export confirmation failed: %v", err)
++	}
++	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
++	var e map[string]any
++	json.Unmarshal([]byte(lines[0]), &e)
++	if e["type"] != "qr" || len(e["pngBase64"].(string)) > 43692 {
++		t.Fatal("bounded PNG event missing")
++	}
++}
++func TestMachineQRAlreadyAuthorizedAndUnverifiedCompletion(t *testing.T) {
++	for _, already := range []bool{true, false} {
++		f, r, w := qrFixture()
++		f.authorized = already
++		f.verified = false
++		f.updates <- struct{}{}
++		var out bytes.Buffer
++		e := MachineQRLogin(context.Background(), f, r, &out, f.updates)
++		w.Close()
++		if already {
++			if e != nil || f.exports != 0 {
++				t.Fatal("authorized session exported")
++			}
++		} else if !errors.Is(e, ErrUnauthorized) || strings.Contains(out.String(), `"type":"account"`) {
++			t.Fatal("unverified account escaped")
++		}
++	}
++}
++func TestMachineQRExpiryCancelEOFAndFlood(t *testing.T) {
++	for _, mode := range []string{"expiry", "future", "cancel", "eof", "flood"} {
++		t.Run(mode, func(t *testing.T) {
++			f, r, w := qrFixture()
++			defer w.Close()
++			ctx, cancel := context.WithCancel(context.Background())
++			defer cancel()
++			switch mode {
++			case "expiry":
++				f.token = qrlogin.NewToken([]byte("synthetic"), int(time.Now().Unix())-1)
++			case "future":
++				f.token = qrlogin.NewToken([]byte("synthetic"), int(time.Now().Unix())+601)
++			case "cancel":
++				f.afterExport = cancel
++			case "eof":
++				w.Close()
++			case "flood":
++				f.err = tgerr.New(420, "FLOOD_WAIT_5")
++				f.updates <- struct{}{}
++			}
++			var out bytes.Buffer
++			e := MachineQRLogin(ctx, f, r, &out, f.updates)
++			if e == nil || f.exports > 1 || strings.Contains(out.String(), `"type":"account"`) {
++				t.Fatal("terminal failure must not refresh/authenticate")
++			}
++			if mode == "expiry" && ErrorCode(e) != "qr_expired" {
++				t.Fatal("missing finite expiry")
++			}
++			if mode == "flood" && ErrorCode(e) != "rate_limited" {
++				t.Fatal("missing finite flood")
++			}
++		})
++	}
++}
++func TestMachineQRPasswordNonceAndStaleInput(t *testing.T) {
++	for _, stale := range []bool{false, true} {
++		f, r, w := qrFixture()
++		f.err = auth.ErrPasswordAuthNeeded
++		f.updates <- struct{}{}
++		var out bytes.Buffer
++		writer := &qrPromptWriter{Buffer: &out, w: w, stale: stale}
++		e := MachineQRLogin(context.Background(), f, r, writer, f.updates)
++		w.Close()
++		if stale {
++			if e == nil || f.passwords != 0 {
++				t.Fatal("stale nonce accepted")
++			}
++		} else if e != nil || f.passwords != 1 || !strings.Contains(out.String(), `"type":"account"`) {
++			t.Fatalf("2FA failed %v", e)
++		}
++	}
++}
++
++type qrPromptWriter struct {
++	*bytes.Buffer
++	w     *io.PipeWriter
++	stale bool
++}
++
++func (w *qrPromptWriter) Write(b []byte) (int, error) {
++	n, e := w.Buffer.Write(b)
++	var v map[string]any
++	json.Unmarshal(b, &v)
++	if v["type"] == "input_required" {
++		nonce := v["promptId"]
++		if w.stale {
++			nonce = "stale"
++		}
++		reply, _ := json.Marshal(map[string]any{"promptId": nonce, "text": "SYNTHETIC-PASSWORD"})
++		go func() { w.w.Write(append(reply, '\n')) }()
++	}
++	return n, e
++}
++
++// The pinned helper's unbuffered default would lose this update before a receiver exists.
++type qrDispatcher struct{ handler tg.LoginTokenHandler }
++
++func (d *qrDispatcher) OnLoginToken(h tg.LoginTokenHandler) { d.handler = h }
++func TestMachineQRUpdateDuringRenderingIsBuffered(t *testing.T) {
++	f, r, w := qrFixture()
++	defer w.Close()
++	d := &qrDispatcher{}
++	updates := BufferedLoginToken(d)
++	out := &qrRenderWriter{d: d}
++	if e := MachineQRLogin(context.Background(), f, r, out, updates); e != nil || f.imports != 1 {
++		t.Fatalf("render-time approval lost: %v", e)
++	}
++}
++
++type qrRenderWriter struct {
++	bytes.Buffer
++	d *qrDispatcher
++}
++
++func (w *qrRenderWriter) Write(b []byte) (int, error) {
++	if bytes.Contains(b, []byte(`"type":"qr"`)) {
++		for i := 0; i < 3; i++ {
++			w.d.handler(context.Background(), tg.Entities{}, &tg.UpdateLoginToken{})
++		}
++	}
++	return w.Buffer.Write(b)
++}
++func TestMachineQRClockExpiryHasNoRefresh(t *testing.T) {
++	f, r, w := qrFixture()
++	defer w.Close()
++	clock := &qrTestClock{Time: neo.NewTime(time.Now()), ready: make(chan struct{})}
++	f.token = qrlogin.NewToken([]byte("synthetic"), int(clock.Now().Add(time.Second).Unix()))
++	var out bytes.Buffer
++	done := make(chan error, 1)
++	go func() { done <- machineQRLogin(context.Background(), f, r, &out, f.updates, clock) }()
++	<-clock.ready
++	clock.Travel(2 * time.Second)
++	if e := <-done; !errors.Is(e, ErrQRExpired) || f.exports != 1 || f.imports != 0 {
++		t.Fatalf("expiry refreshed: %v", e)
++	}
++}
++func TestMachineIdentityContradictoryStatus(t *testing.T) {
++	f := &qrContradiction{fakeAccount: fakeAccount{authorized: true, id: 42}}
++	var out bytes.Buffer
++	if e := MachineIdentity(context.Background(), f, &out); !errors.Is(e, ErrUnauthorized) || out.Len() != 0 {
++		t.Fatal("contradictory status accepted")
++	}
++}
++
++type qrContradiction struct{ fakeAccount }
++
++func (f *qrContradiction) Status(context.Context) (*auth.Status, error) {
++	return &auth.Status{Authorized: true, User: &tg.User{ID: 43}}, nil
++}
++
++type qrTestClock struct {
++	*neo.Time
++	ready chan struct{}
++}
++
++func (c *qrTestClock) Timer(d time.Duration) tdclock.Timer {
++	timer := c.Time.Timer(d)
++	close(c.ready)
++	return timer
++}
++
++// Runs the production state machine through the pinned SDK's actual Import,
++// with only the MTProto invoker replaced. No socket or real account is involved.
++func TestMachineQRSDKConfirmationMigration(t *testing.T) {
++	mock := tgmock.New(t)
++	migrated := false
++	sdk := qrlogin.NewQR(tg.NewClient(mock), 12345, "synthetic-app-hash", qrlogin.Options{Migrate: func(_ context.Context, dc int) error {
++		if dc != 2 {
++			t.Fatal("wrong migration DC")
++		}
++		migrated = true
++		return nil
++	}})
++	mock.ExpectCall(&tg.AuthExportLoginTokenRequest{APIID: 12345, APIHash: "synthetic-app-hash"}).ThenResult(&tg.AuthLoginToken{Token: []byte("synthetic-initial-token"), Expires: int(time.Now().Add(time.Minute).Unix())}).ExpectCall(&tg.AuthExportLoginTokenRequest{APIID: 12345, APIHash: "synthetic-app-hash"}).ThenResult(&tg.AuthLoginTokenMigrateTo{DCID: 2, Token: []byte("synthetic-migration-token")}).ExpectCall(&tg.AuthImportLoginTokenRequest{Token: []byte("synthetic-migration-token")}).ThenResult(&tg.AuthLoginTokenSuccess{Authorization: &tg.AuthAuthorization{User: &tg.User{ID: 42}}})
++	f, r, w := qrFixture()
++	defer w.Close()
++	f.updates <- struct{}{}
++	client := &qrSDKClient{qrFake: f, sdk: sdk}
++	var out bytes.Buffer
++	if e := MachineQRLogin(context.Background(), client, r, &out, f.updates); e != nil || !migrated || !strings.Contains(out.String(), `"accountId":"42"`) {
++		t.Fatalf("SDK import/migration integration failed %v", e)
++	}
++}
++
++type qrSDKClient struct {
++	*qrFake
++	sdk qrlogin.QR
++}
++
++func (c *qrSDKClient) Export(ctx context.Context, ids ...int64) (qrlogin.Token, error) {
++	return c.sdk.Export(ctx, ids...)
++}
++func (c *qrSDKClient) Import(ctx context.Context) (*tg.AuthAuthorization, error) {
++	a, e := c.sdk.Import(ctx)
++	c.authorized = e == nil
++	return a, e
++}
++
++type qrAuthMismatch struct{ *qrFake }
++
++func (c *qrAuthMismatch) Import(context.Context) (*tg.AuthAuthorization, error) {
++	c.authorized = true
++	return &tg.AuthAuthorization{User: &tg.User{ID: 43}}, nil
++}
++func TestMachineQRImportIdentityMustMatchFreshSelf(t *testing.T) {
++	f, r, w := qrFixture()
++	defer w.Close()
++	f.updates <- struct{}{}
++	var out bytes.Buffer
++	e := MachineQRLogin(context.Background(), &qrAuthMismatch{f}, r, &out, f.updates)
++	if !errors.Is(e, ErrUnauthorized) || strings.Contains(out.String(), `"type":"account"`) {
++		t.Fatal("contradictory import identity accepted")
++	}
++}
++
++func TestMachineQRStaleInputBefore2FACannotAuthorize(t *testing.T) {
++	f, r, w := qrFixture()
++	defer w.Close()
++	f.err = auth.ErrPasswordAuthNeeded
++	sent := make(chan struct{})
++	go func() {
++		w.Write([]byte("{\"promptId\":\"stale-before-prompt\",\"text\":\"SYNTHETIC-STALE\"}\n"))
++		close(sent)
++	}()
++	f.afterExport = func() { <-sent; f.updates <- struct{}{} }
++	var out bytes.Buffer
++	e := MachineQRLogin(context.Background(), f, r, &out, f.updates)
++	if e == nil || f.passwords != 0 || strings.Contains(out.String(), `"type":"account"`) {
++		t.Fatal("pre-prompt input authorized2FA")
++	}
++}
+diff --git a/app/login/machine_test.go b/app/login/machine_test.go
+new file mode 100644
+index 0000000..d5d99fa
+--- /dev/null
++++ b/app/login/machine_test.go
+@@ -0,0 +1,49 @@
++package login
++
++import (
++	"bytes"
++	"context"
++	"encoding/json"
++	"github.com/gotd/td/telegram/auth"
++	"github.com/gotd/td/tg"
++	"testing"
++)
++
++type fakeAccount struct {
++	authorized                   bool
++	id                           int64
++	status, self, login, history int
++}
++
++func (f *fakeAccount) Status(context.Context) (*auth.Status, error) {
++	f.status++
++	return &auth.Status{Authorized: f.authorized}, nil
++}
++func (f *fakeAccount) Self(context.Context) (*tg.User, error) {
++	f.self++
++	return &tg.User{ID: f.id, FirstName: "synthetic"}, nil
++}
++func (f *fakeAccount) IfNecessary(context.Context, auth.Flow) error {
++	f.login++
++	f.authorized = true
++	return nil
++}
++func TestMachineIdentity(t *testing.T) {
++	for _, id := range []int64{9007199254740993, 9007199254740995} {
++		f := &fakeAccount{authorized: true, id: id}
++		var b bytes.Buffer
++		if e := MachineIdentity(context.Background(), f, &b); e != nil {
++			t.Fatal(e)
++		}
++		var event map[string]any
++		json.Unmarshal(b.Bytes(), &event)
++		if event["accountId"] != fmtID(id) || f.self != 1 || f.status != 1 || f.login != 0 || f.history != 0 {
++			t.Fatal("identity boundary")
++		}
++	}
++	f := &fakeAccount{}
++	var b bytes.Buffer
++	if e := MachineIdentity(context.Background(), f, &b); e == nil || b.Len() != 0 || f.login != 0 || f.self != 0 || f.history != 0 {
++		t.Fatal("unauthorized boundary")
++	}
++}
+diff --git a/app/login/resend_test.go b/app/login/resend_test.go
+new file mode 100644
+index 0000000..15f4d81
+--- /dev/null
++++ b/app/login/resend_test.go
+@@ -0,0 +1,168 @@
++package login
++
++import (
++	"bufio"
++	"context"
++	"encoding/json"
++	"github.com/gotd/td/telegram/auth"
++	"github.com/gotd/td/tg"
++	"github.com/gotd/td/tgerr"
++	"io"
++	"os"
++	"strings"
++	"testing"
++	"time"
++)
++
++type resendFake struct {
++	fakeAccount
++	calls       []string
++	hash        string
++	resendError error
++	unsupported bool
++	timeout     int
++	twoFA       bool
++}
++
++func (f *resendFake) sent(hash string) *tg.AuthSentCode {
++	s := &tg.AuthSentCode{PhoneCodeHash: hash, Type: &tg.AuthSentCodeTypeApp{Length: 5}}
++	s.SetNextType(&tg.AuthCodeTypeSMS{})
++	s.SetTimeout(f.timeout)
++	if f.unsupported {
++		s.Type = &tg.AuthSentCodeTypeFirebaseSMS{Length: 5}
++	}
++	return s
++}
++func (f *resendFake) SendCode(context.Context, string, auth.SendCodeOptions) (tg.AuthSentCodeClass, error) {
++	f.calls = append(f.calls, "send")
++	return f.sent("PRIVATE_HASH_OLD"), nil
++}
++func (f *resendFake) ResendCode(_ context.Context, phone, hash string) (tg.AuthSentCodeClass, error) {
++	f.calls = append(f.calls, "resend")
++	if hash != "PRIVATE_HASH_OLD" && hash != "PRIVATE_HASH_NEW" {
++		panic("bad resend hash")
++	}
++	if f.resendError != nil {
++		return nil, f.resendError
++	}
++	return f.sent("PRIVATE_HASH_NEW"), nil
++}
++func (f *resendFake) SignIn(_ context.Context, phone, code, hash string) (*tg.AuthAuthorization, error) {
++	f.calls = append(f.calls, "signin")
++	f.hash = hash
++	if f.twoFA {
++		return nil, auth.ErrPasswordAuthNeeded
++	}
++	f.authorized = true
++	return &tg.AuthAuthorization{}, nil
++}
++func (f *resendFake) Password(context.Context, string) (*tg.AuthAuthorization, error) {
++	f.calls = append(f.calls, "password")
++	f.authorized = true
++	return &tg.AuthAuthorization{}, nil
++}
++func TestOwnedLoginResendState(t *testing.T) {
++	for _, mode := range []string{"resend", "early", "stale", "unsupported", "flood", "cancel", "twofa", "exhausted"} {
++		t.Run(mode, func(t *testing.T) {
++			inR, inW, _ := os.Pipe()
++			outR, outW, _ := os.Pipe()
++			defer inW.Close()
++			defer outR.Close()
++			defer outW.Close()
++			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
++			defer cancel()
++			f := &resendFake{fakeAccount: fakeAccount{id: 9}, unsupported: mode == "unsupported", twoFA: mode == "twofa"}
++			if mode == "early" {
++				f.timeout = 60
++			}
++			if mode == "flood" {
++				f.resendError = tgerr.New(420, "FLOOD_WAIT_3600")
++			}
++			done := make(chan error, 1)
++			go func() { done <- MachineLogin(ctx, f, inR, outW); outW.Close() }()
++			reader := bufio.NewReader(outR)
++			prompts := 0
++			oldNonce := ""
++			account := false
++			for {
++				line, e := reader.ReadBytes('\n')
++				if e == io.EOF {
++					break
++				}
++				if e != nil {
++					t.Fatal(e)
++				}
++				if strings.Contains(string(line), "PRIVATE_HASH") {
++					t.Fatal("secret leaked")
++				}
++				var event map[string]any
++				if json.Unmarshal(line, &event) != nil {
++					t.Fatal("bad JSON")
++				}
++				if event["type"] == "account" {
++					account = true
++					continue
++				}
++				prompts++
++				nonce := event["promptId"].(string)
++				reply := map[string]string{"promptId": nonce, "text": "synthetic"}
++				if event["field"] == "code" {
++					d := event["delivery"].(map[string]any)
++					if d["method"] != "app" || d["nextMethod"] != "sms" {
++						t.Fatal("method lost")
++					}
++					if mode == "cancel" {
++						cancel()
++						continue
++					}
++					if mode == "early" || mode == "flood" || mode == "resend" && oldNonce == "" || mode == "stale" && oldNonce == "" || mode == "exhausted" {
++						delete(reply, "text")
++						reply["action"] = "resend"
++					}
++					if mode == "stale" && oldNonce != "" {
++						reply["promptId"] = oldNonce
++					}
++					if oldNonce == "" {
++						oldNonce = nonce
++					}
++				}
++				b, _ := json.Marshal(reply)
++				inW.Write(append(b, '\n'))
++			}
++			err := <-done
++			if mode == "resend" || mode == "twofa" {
++				if err != nil || !account {
++					t.Fatalf("success lost %v", err)
++				}
++				if mode == "resend" && f.hash != "PRIVATE_HASH_NEW" {
++					t.Fatal("stale hash signin")
++				}
++				if mode == "twofa" && (len(f.calls) == 0 || f.calls[len(f.calls)-1] != "password") {
++					t.Fatal("2FA lost")
++				}
++			} else {
++				if err == nil || account {
++					t.Fatal("invalid attempt succeeded")
++				}
++				for _, c := range f.calls {
++					if c == "signin" {
++						t.Fatal("unexpected signin")
++					}
++				}
++			}
++			n := 0
++			for _, c := range f.calls {
++				if c == "resend" {
++					n++
++				}
++			}
++			expected := map[string]int{"resend": 1, "stale": 1, "flood": 1, "exhausted": 3}[mode]
++			if n != expected {
++				t.Fatalf("resend calls %d want %d", n, expected)
++			}
++			if mode == "unsupported" && prompts != 1 {
++				t.Fatal("unsupported method prompted for code")
++			}
++		})
++	}
++}
+diff --git a/app/login/subprocess_test.go b/app/login/subprocess_test.go
+new file mode 100644
+index 0000000..a07edb9
+--- /dev/null
++++ b/app/login/subprocess_test.go
+@@ -0,0 +1,111 @@
++package login
++
++import (
++	"bufio"
++	"bytes"
++	"context"
++	"encoding/json"
++	"errors"
++	"github.com/gotd/td/telegram/auth"
++	"github.com/gotd/td/tg"
++	"os"
++	"os/exec"
++	"strings"
++	"testing"
++	"time"
++)
++
++type flowFake struct{ fakeAccount }
++
++func (f *flowFake) IfNecessary(ctx context.Context, flow auth.Flow) error {
++	f.login++
++	if f.authorized {
++		return nil
++	}
++	if e := flow.Run(ctx, f); e != nil {
++		return e
++	}
++	f.authorized = true
++	return nil
++}
++func (f *flowFake) SendCode(context.Context, string, auth.SendCodeOptions) (tg.AuthSentCodeClass, error) {
++	return &tg.AuthSentCode{PhoneCodeHash: "synthetic-hash", Type: &tg.AuthSentCodeTypeApp{Length: 5}}, nil
++}
++func (f *flowFake) SignIn(context.Context, string, string, string) (*tg.AuthAuthorization, error) {
++	return nil, auth.ErrPasswordAuthNeeded
++}
++func (f *flowFake) Password(context.Context, string) (*tg.AuthAuthorization, error) {
++	f.authorized = true
++	return &tg.AuthAuthorization{}, nil
++}
++func (f *flowFake) ResendCode(context.Context, string, string) (tg.AuthSentCodeClass, error) {
++	return nil, errors.New("unexpected resend")
++}
++func (f *flowFake) SignUp(context.Context, auth.SignUp) (*tg.AuthAuthorization, error) {
++	return nil, errors.New("unexpected signup")
++}
++
++func TestMachineSubprocess(t *testing.T) {
++	if os.Getenv("UMH_SYNTHETIC_CHILD") == "1" {
++		f := &flowFake{fakeAccount: fakeAccount{id: 9007199254740993}}
++		if e := MachineLogin(context.Background(), f, os.Stdin, os.Stdout); e != nil {
++			MachineError(os.Stdout, e)
++			os.Exit(2)
++		}
++		os.Exit(0)
++	}
++	for _, fail := range []bool{false, true} {
++		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
++		c := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestMachineSubprocess$")
++		c.Env = append(os.Environ(), "UMH_SYNTHETIC_CHILD=1")
++		in, _ := c.StdinPipe()
++		out, _ := c.StdoutPipe()
++		var stderr bytes.Buffer
++		c.Stderr = &stderr
++		if e := c.Start(); e != nil {
++			t.Fatal(e)
++		}
++		scan := bufio.NewScanner(out)
++		var transcript strings.Builder
++		count := 0
++		account := false
++		for scan.Scan() {
++			line := scan.Text()
++			transcript.WriteString(line)
++			var event map[string]any
++			if json.Unmarshal([]byte(line), &event) != nil {
++				t.Fatal("non JSON output")
++			}
++			if event["type"] == "input_required" {
++				count++
++				id := event["promptId"]
++				if fail {
++					id = "stale"
++				}
++				b, _ := json.Marshal(map[string]any{"promptId": id, "text": "secret-合成"})
++				in.Write(append(b, '\n'))
++			}
++			if event["type"] == "account" {
++				account = event["accountId"] == "9007199254740993"
++			}
++		}
++		in.Close()
++		e := c.Wait()
++		cancel()
++		if fail && (e == nil || account) || !fail && (e != nil || !account || count != 3) {
++			t.Fatal("incorrect machine outcome")
++		}
++		if strings.Contains(transcript.String()+stderr.String(), "secret-") || stderr.Len() != 0 {
++			t.Fatal("secret or raw diagnostic leaked")
++		}
++	}
++}
++func TestSanitizedErrors(t *testing.T) {
++	for _, e := range []error{errors.New("synthetic-secret"), context.Canceled, ErrUnauthorized} {
++		var b bytes.Buffer
++		MachineError(&b, e)
++		if strings.Contains(b.String(), "secret") || !json.Valid(bytes.TrimSpace(b.Bytes())) {
++			t.Fatal("unsafe diagnostics")
++		}
++	}
++}
+diff --git a/cmd/chat.go b/cmd/chat.go
+index 8c8abb3..0090a22 100644
+--- a/cmd/chat.go
++++ b/cmd/chat.go
+@@ -98,6 +98,8 @@ func NewChatExport() *cobra.Command {
+ 	cmd.Flags().VarP(&opts.Type, _type, "T", fmt.Sprintf("export type: [%s]", strings.Join(chat.ExportTypeNames(), ", ")))
+ 	cmd.Flags().StringVarP(&opts.Chat, _chat, "c", "", "chat id or domain. If not specified, 'Saved Messages' will be used")
+ 
++	cmd.Flags().StringVar(&opts.PeerType, "peer-type", "", "exact numeric peer kind: user, chat, channel; no fallback")
++	cmd.Flags().BoolVar(&opts.StrictPeer, "strict-peer", false, "reject empty chat and untyped numeric selectors")
+ 	// topic id and message id is the same field in tg.MessagesGetRepliesRequest
+ 	cmd.Flags().IntVar(&opts.Thread, "topic", 0, "specify topic id")
+ 	cmd.Flags().IntVar(&opts.Thread, "reply", 0, "specify channel post id")
+diff --git a/cmd/dl.go b/cmd/dl.go
+index 6540ee8..f3939b3 100644
+--- a/cmd/dl.go
++++ b/cmd/dl.go
+@@ -27,6 +27,9 @@ func NewDownload() *cobra.Command {
+ 				return fmt.Errorf("no urls or files provided")
+ 			}
+ 
++			if opts.StrictPeer && (opts.Group || opts.Serve || len(opts.URLs) != 0 || len(opts.Files) != 1) {
++				return fmt.Errorf("strict selection requires one typed file and no group, URLs or serve")
++			}
+ 			opts.Template = viper.GetString(consts.FlagDlTemplate)
+ 
+ 			return tRun(cmd.Context(), func(ctx context.Context, c *telegram.Client, kvd storage.Storage) error {
+@@ -61,6 +64,7 @@ func NewDownload() *cobra.Command {
+ 	cmd.Flags().BoolVar(&opts.Takeout, "takeout", false, "takeout sessions let you export data from your account with lower flood wait limits.")
+ 	cmd.Flags().BoolVar(&opts.Group, "group", false, "auto detect grouped message and download all of them")
+ 
++	cmd.Flags().BoolVar(&opts.StrictPeer, "strict-peer", false, "require one bounded lossless typed selected file")
+ 	// resume flags, if both false then ask user
+ 	cmd.Flags().BoolVar(&opts.Continue, _continue, false, "continue the last download directly")
+ 	cmd.Flags().BoolVar(&opts.Restart, restart, false, "restart the last download directly")
+diff --git a/cmd/root.go b/cmd/root.go
+index b268dd5..b7eed72 100644
+--- a/cmd/root.go
++++ b/cmd/root.go
+@@ -71,14 +71,21 @@ func New() *cobra.Command {
+ 		SilenceErrors: true,
+ 		SilenceUsage:  true,
+ 		PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
+-			// init logger
+-			debug, level := viper.GetBool(consts.FlagDebug), zap.InfoLevel
+-			if debug {
+-				level = zap.DebugLevel
+-			}
+-			cmd.SetContext(logctx.With(cmd.Context(),
+-				logutil.New(level, filepath.Join(consts.LogPath, "latest.log"))))
++			if IsMachine(cmd) {
++				if !cmd.Flags().Lookup(consts.FlagStorage).Changed || !cmd.Flags().Lookup(consts.FlagNamespace).Changed {
++					return fmt.Errorf("explicit storage and namespace required")
++				}
++				cmd.SetContext(logctx.With(cmd.Context(), zap.NewNop()))
++			} else {
++				// init logger
++				debug, level := viper.GetBool(consts.FlagDebug), zap.InfoLevel
++				if debug {
++					level = zap.DebugLevel
++				}
++				cmd.SetContext(logctx.With(cmd.Context(),
++					logutil.New(level, filepath.Join(consts.LogPath, "latest.log"))))
+ 
++			}
+ 			ns := viper.GetString(consts.FlagNamespace)
+ 			if ns != "" {
+ 				logctx.From(cmd.Context()).Info("Namespace",
+@@ -139,7 +146,7 @@ func New() *cobra.Command {
+ 
+ 	cmd.AddCommand(NewVersion(), NewLogin(), NewDownload(), NewForward(),
+ 		NewChat(), NewUpload(), NewBackup(), NewRecover(), NewMigrate(),
+-		NewGen(), NewExtension(em))
++		NewGen(), NewExtension(em), NewUMH())
+ 
+ 	// append extension command to root
+ 	exts, _ := em.List(context.Background(), false)
+@@ -155,6 +162,7 @@ func New() *cobra.Command {
+ 	cmd.PersistentFlags().String(consts.FlagProxy, "", "proxy address, format: protocol://username:password@host:port")
+ 	cmd.PersistentFlags().StringP(consts.FlagNamespace, "n", "default", "namespace for Telegram session")
+ 	cmd.PersistentFlags().Bool(consts.FlagDebug, false, "enable debug mode")
++	cmd.PersistentFlags().Bool(consts.FlagFailOnFloodWait, false, "return Telegram flood-wait errors immediately instead of automatically waiting")
+ 
+ 	cmd.PersistentFlags().IntP(consts.FlagPartSize, "s", 512*1024, "part size for transfer")
+ 	_ = cmd.PersistentFlags().MarkDeprecated(consts.FlagPartSize, "part size has been set to maximum by default, this flag will be removed in the future")
+@@ -225,6 +233,7 @@ func tOptions(ctx context.Context) (tclient.Options, error) {
+ 		NTP:              viper.GetString(consts.FlagNTP),
+ 		ReconnectTimeout: viper.GetDuration(consts.FlagReconnectTimeout),
+ 		UpdateHandler:    nil,
++		FailOnFloodWait:  viper.GetBool(consts.FlagFailOnFloodWait),
+ 	}
+ 
+ 	return o, nil
+diff --git a/cmd/umh.go b/cmd/umh.go
+new file mode 100644
+index 0000000..83fd99d
+--- /dev/null
++++ b/cmd/umh.go
+@@ -0,0 +1,151 @@
++// UMH additions to tdl v0.20.4; licensed under the upstream AGPL-3.0.
++package cmd
++
++import (
++	"context"
++	"errors"
++	"github.com/gotd/td/telegram"
++	"github.com/gotd/td/telegram/auth"
++	"github.com/gotd/td/telegram/auth/qrlogin"
++	"github.com/gotd/td/tg"
++	"github.com/iyear/tdl/app/chat"
++	"github.com/iyear/tdl/app/login"
++	"github.com/iyear/tdl/core/storage"
++	"github.com/iyear/tdl/core/umh"
++	"github.com/iyear/tdl/pkg/key"
++	"github.com/iyear/tdl/pkg/tclient"
++	"github.com/spf13/cobra"
++	"os"
++	"time"
++)
++
++func IsMachine(c *cobra.Command) bool {
++	for ; c != nil; c = c.Parent() {
++		if c.Name() == "umh" {
++			return true
++		}
++	}
++	return false
++}
++
++type accountClient struct{ c *telegram.Client }
++
++func (a accountClient) Status(c context.Context) (*auth.Status, error) { return a.c.Auth().Status(c) }
++func (a accountClient) Self(c context.Context) (*tg.User, error)       { return a.c.Self(c) }
++func (a accountClient) SendCode(c context.Context, phone string, opts auth.SendCodeOptions) (tg.AuthSentCodeClass, error) {
++	return a.c.Auth().SendCode(c, phone, opts)
++}
++func (a accountClient) ResendCode(c context.Context, phone, hash string) (tg.AuthSentCodeClass, error) {
++	return a.c.Auth().ResendCode(c, phone, hash)
++}
++func (a accountClient) SignIn(c context.Context, phone, code, hash string) (*tg.AuthAuthorization, error) {
++	return a.c.Auth().SignIn(c, phone, code, hash)
++}
++func (a accountClient) Password(c context.Context, password string) (*tg.AuthAuthorization, error) {
++	return a.c.Auth().Password(c, password)
++}
++
++func (a accountClient) Export(ctx context.Context, ids ...int64) (qrlogin.Token, error) {
++	return a.c.QR().Export(ctx, ids...)
++}
++func (a accountClient) Import(ctx context.Context) (*tg.AuthAuthorization, error) {
++	return a.c.QR().Import(ctx)
++}
++func NewUMH() *cobra.Command {
++	root := &cobra.Command{Use: "umh", Short: "UMH private JSON pipe authentication and identity", GroupID: groupAccount.ID}
++	root.AddCommand(newMachineChats())
++	for _, name := range []string{"login", "login-qr", "identity"} {
++		name := name
++		c := &cobra.Command{Use: name, Args: cobra.NoArgs, RunE: func(cmd *cobra.Command, args []string) error {
++			limit := 2 * time.Minute
++			if name == "login" || name == "login-qr" {
++				limit = 10 * time.Minute
++			}
++			ctx, cancel := context.WithTimeout(cmd.Context(), limit)
++			defer cancel()
++			opts, e := tOptions(ctx)
++			if e != nil {
++				return e
++			}
++			if name == "login" || name == "login-qr" {
++				if _, e := opts.KV.Get(ctx, key.App()); errors.Is(e, storage.ErrNotFound) {
++					if e = opts.KV.Set(ctx, key.App(), []byte(tclient.AppDesktop)); e != nil {
++						return e
++					}
++				} else if e != nil {
++					return e
++				}
++			}
++			var updates <-chan struct{}
++			if name == "login-qr" {
++				d := tg.NewUpdateDispatcher()
++				updates = login.BufferedLoginToken(d)
++				opts.UpdateHandler = d
++			}
++			// false loads the dedicated existing session, enabling an authorized no-prompt check.
++			opts.FailOnFloodWait = true // machine auth/identity must preserve explicit rate-limit errors
++			client, e := tclient.New(ctx, opts, false)
++			if e != nil {
++				return e
++			}
++			return client.Run(ctx, func(ctx context.Context) error {
++				a := accountClient{client}
++				if name == "login-qr" {
++					return login.MachineQRLogin(ctx, a, os.Stdin, cmd.OutOrStdout(), updates)
++				}
++				if name == "login" || name == "login-qr" {
++					return login.MachineLogin(ctx, a, os.Stdin, cmd.OutOrStdout())
++				}
++				return login.MachineIdentity(ctx, a, cmd.OutOrStdout())
++			})
++		}}
++		root.AddCommand(c)
++	}
++	return root
++}
++
++func newMachineChats() *cobra.Command {
++	limit := 50
++	validate := func() error {
++		if limit < 1 || limit > chat.MachineMaxLimit {
++			return umh.ErrInput
++		}
++		return nil
++	}
++	c := &cobra.Command{Use: "chats", Short: "Read bounded chat metadata from the main list and archive", Args: func(cmd *cobra.Command, args []string) error {
++		if len(args) != 0 {
++			return umh.ErrInput
++		}
++		return validate()
++	}, RunE: func(cmd *cobra.Command, args []string) error {
++		if err := validate(); err != nil {
++			return err
++		}
++		ctx, cancel := context.WithTimeout(cmd.Context(), 5*time.Minute)
++		defer cancel()
++		if err := ctx.Err(); err != nil {
++			return err
++		}
++		opts, err := tOptions(ctx)
++		if err != nil {
++			return err
++		}
++		opts.FailOnFloodWait = true
++		client, err := tclient.New(ctx, opts, false)
++		if err != nil {
++			return err
++		}
++		return client.Run(ctx, func(ctx context.Context) error {
++			status, err := client.Auth().Status(ctx)
++			if err != nil {
++				return err
++			}
++			if status == nil || !status.Authorized {
++				return login.ErrUnauthorized
++			}
++			return chat.MachineList(ctx, client.API(), limit, cmd.OutOrStdout())
++		})
++	}}
++	c.Flags().IntVar(&limit, "limit", 50, "Maximum chat metadata entries (1..5000), main list then archive")
++	return c
++}
+diff --git a/cmd/umh_test.go b/cmd/umh_test.go
+new file mode 100644
+index 0000000..c025ae1
+--- /dev/null
++++ b/cmd/umh_test.go
+@@ -0,0 +1,91 @@
++package cmd
++
++import (
++	"context"
++	"errors"
++	"github.com/iyear/tdl/core/umh"
++	"github.com/iyear/tdl/pkg/kv"
++	"github.com/spf13/cobra"
++	"io"
++	"testing"
++)
++
++func TestMachineChatsCommandAndEarlyLimitValidation(t *testing.T) {
++	for _, limit := range []string{"0", "5001", "-1"} {
++		r := NewUMH()
++		c, _, err := r.Find([]string{"chats"})
++		if err != nil || c == nil || c.Name() != "chats" || !IsMachine(c) || c.RunE == nil {
++			t.Fatal("missing bounded machine chats command")
++		}
++		if c.Flags().Lookup("limit") == nil || c.Flags().Lookup("limit").DefValue != "50" {
++			t.Fatal("missing finite default limit")
++		}
++		if err := c.ParseFlags([]string{"--limit", limit}); err != nil {
++			t.Fatal(err)
++		}
++		// No initialized storage or client exists. Invalid limits must return first.
++		if err := c.RunE(c, nil); !errors.Is(err, umh.ErrInput) {
++			t.Fatalf("limit reached initialization: %v", err)
++		}
++		if c.Args == nil || c.Args(c, []string{"unexpected"}) == nil {
++			t.Fatal("positional arguments allowed")
++		}
++	}
++}
++
++func TestMachineChatsRejectsBeforeRootInitialization(t *testing.T) {
++	for _, args := range [][]string{{"--limit", "0"}, {"--limit", "5001"}, {"--limit", "1.5"}, {"extra"}} {
++		initialized := false
++		r := &cobra.Command{Use: "offline", SilenceUsage: true, SilenceErrors: true, PersistentPreRunE: func(*cobra.Command, []string) error {
++			initialized = true
++			return errors.New("initialization must not run")
++		}}
++		r.SetOut(io.Discard)
++		r.SetErr(io.Discard)
++		group := NewUMH()
++		group.GroupID = ""
++		r.AddCommand(group)
++		r.SetArgs(append([]string{"umh", "chats"}, args...))
++		if err := r.ExecuteContext(context.Background()); err == nil || initialized {
++			t.Fatal("invalid args reached root initialization")
++		}
++	}
++}
++
++func TestMachineCommands(t *testing.T) {
++	r := New()
++	for _, args := range [][]string{{"umh", "identity"}, {"umh", "login"}, {"umh", "login-qr"}} {
++		c, _, e := r.Find(args)
++		if e != nil || c == nil || !IsMachine(c) || c.RunE == nil {
++			t.Fatal("missing machine route")
++		}
++	}
++}
++
++func TestFailOnFloodWaitFlagReachesClientOptions(t *testing.T) {
++	storage, err := kv.NewWithMap(map[string]string{"type": "bolt", "path": t.TempDir()})
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer storage.Close()
++	for _, arg := range []string{"--fail-on-flood-wait=false", "--fail-on-flood-wait=true"} {
++		root := New()
++		if err := root.ParseFlags([]string{arg}); err != nil {
++			t.Fatal(err)
++		}
++		opts, err := tOptions(kv.With(context.Background(), storage))
++		if err != nil || opts.FailOnFloodWait != (arg == "--fail-on-flood-wait=true") {
++			t.Fatal("global flag did not reach client options")
++		}
++	}
++}
++func TestStrictFlags(t *testing.T) {
++	for _, c := range []*cobra.Command{NewDownload(), NewChatExport()} {
++		if c.Flags().Lookup("strict-peer") == nil {
++			t.Fatal("missing strict path")
++		}
++	}
++	if NewChatExport().Flags().Lookup("peer-type") == nil {
++		t.Fatal("missing selector")
++	}
++}
+diff --git a/core/tclient/tclient.go b/core/tclient/tclient.go
+index 4854a0c..7bfc952 100644
+--- a/core/tclient/tclient.go
++++ b/core/tclient/tclient.go
+@@ -38,10 +38,11 @@ type Options struct {
+ 	NTP              string
+ 	ReconnectTimeout time.Duration
+ 	UpdateHandler    telegram.UpdateHandler
++	FailOnFloodWait  bool // propagate Telegram flood errors immediately for machine consumers
+ }
+ 
+ // New creates new telegram client with given options.
+-// Default middlewares(retry, recovery, flood wait) always added.
++// Recovery/retry are always added; flood waiting is disabled only by explicit policy.
+ func New(ctx context.Context, o Options) (*telegram.Client, error) {
+ 	// process clock
+ 	tclock := tdclock.System
+@@ -79,7 +80,7 @@ func New(ctx context.Context, o Options) (*telegram.Client, error) {
+ 		RetryInterval:  5 * time.Second,
+ 		MaxRetries:     5,
+ 		DialTimeout:    10 * time.Second,
+-		Middlewares:    append(NewDefaultMiddlewares(ctx, o.ReconnectTimeout), o.Middlewares...),
++		Middlewares:    append(NewDefaultMiddlewares(ctx, o.ReconnectTimeout, o.FailOnFloodWait), o.Middlewares...),
+ 		Clock:          tclock,
+ 		Logger:         logctx.From(ctx).Named("td"),
+ 	}
+@@ -87,12 +88,15 @@ func New(ctx context.Context, o Options) (*telegram.Client, error) {
+ 	return telegram.NewClient(o.AppID, o.AppHash, opts), nil
+ }
+ 
+-func NewDefaultMiddlewares(ctx context.Context, timeout time.Duration) []telegram.Middleware {
+-	return []telegram.Middleware{
++func NewDefaultMiddlewares(ctx context.Context, timeout time.Duration, failOnFloodWait ...bool) []telegram.Middleware {
++	chain := []telegram.Middleware{
+ 		recovery.New(ctx, newBackoff(timeout)),
+ 		retry.New(5),
+-		floodwait.NewSimpleWaiter(),
+ 	}
++	if len(failOnFloodWait) == 0 || !failOnFloodWait[0] {
++		chain = append(chain, floodwait.NewSimpleWaiter())
++	}
++	return chain
+ }
+ 
+ func newBackoff(timeout time.Duration) backoff.BackOff {
+diff --git a/core/umh/pipe.go b/core/umh/pipe.go
+new file mode 100644
+index 0000000..3f6cb60
+--- /dev/null
++++ b/core/umh/pipe.go
+@@ -0,0 +1,133 @@
++// UMH additions to tdl v0.20.4; licensed under the upstream AGPL-3.0.
++package umh
++
++import (
++	"bufio"
++	"context"
++	"crypto/rand"
++	"encoding/hex"
++	"encoding/json"
++	"io"
++	"sync"
++)
++
++type Pipe struct {
++	in        io.ReadCloser
++	reader    *bufio.Reader
++	out       io.Writer
++	mu        sync.Mutex
++	closeOnce sync.Once
++	lines     chan []byte
++	ended     chan struct{}
++}
++
++func NewPipe(in io.ReadCloser, out io.Writer) *Pipe {
++	return &Pipe{in: in, reader: bufio.NewReaderSize(in, 65537), out: out}
++}
++
++// NewWatchingPipe uses exactly one bounded reader, also observing EOF during QR waits.
++func NewWatchingPipe(in io.ReadCloser, out io.Writer) *Pipe {
++	p := NewPipe(in, out)
++	p.lines = make(chan []byte, 1)
++	p.ended = make(chan struct{})
++	go func() {
++		defer close(p.ended)
++		defer close(p.lines)
++		for {
++			line, e := p.reader.ReadSlice('\n')
++			if e != nil || len(line) > 65536 {
++				return
++			}
++			b := append([]byte(nil), line...)
++			select {
++			case p.lines <- b:
++			default:
++				return
++			}
++		}
++	}()
++	return p
++}
++func (p *Pipe) Ended() <-chan struct{} { return p.ended }
++
++// Some Windows anonymous pipes cannot interrupt a synchronous Read via Close. Never wait for that OS call; the owning process exits on cancellation.
++func (p *Pipe) Close() error { p.closeOnce.Do(func() { go p.in.Close() }); return nil }
++
++type Delivery struct {
++	Method           string `json:"method"`
++	NextMethod       string `json:"nextMethod,omitempty"`
++	TimeoutSeconds   *int   `json:"timeoutSeconds,omitempty"`
++	ResendsRemaining int    `json:"resendsRemaining"`
++}
++type Reply struct {
++	Text   string
++	Resend bool
++}
++
++func (p *Pipe) Ask(ctx context.Context, field string) (string, error) {
++	r, e := p.ask(ctx, field, nil)
++	return r.Text, e
++}
++func (p *Pipe) AskCode(ctx context.Context, d Delivery) (Reply, error) { return p.ask(ctx, "code", &d) }
++func (p *Pipe) ask(ctx context.Context, field string, delivery *Delivery) (Reply, error) {
++	p.mu.Lock()
++	defer p.mu.Unlock()
++	if ctx.Err() != nil {
++		return Reply{}, ctx.Err()
++	}
++	if field != "phone" && field != "code" && field != "password" {
++		return Reply{}, ErrInput
++	}
++	b := make([]byte, 24)
++	if _, e := rand.Read(b); e != nil {
++		return Reply{}, ErrInput
++	}
++	nonce := hex.EncodeToString(b)
++	typ := "password"
++	if field == "phone" {
++		typ = "text"
++	}
++	event := map[string]any{"version": 1, "type": "input_required", "promptId": nonce, "field": field, "inputType": typ}
++	if delivery != nil {
++		event["delivery"] = delivery
++	}
++	if e := json.NewEncoder(p.out).Encode(event); e != nil {
++		return Reply{}, ErrInput
++	}
++	type result struct {
++		s Reply
++		e error
++	}
++	done := make(chan result, 1)
++	go func() {
++		line, e := p.readLine(ctx)
++		if e != nil || len(line) > 65536 {
++			done <- result{e: ErrInput}
++			return
++		}
++		s, e := promptResponse(line, nonce, delivery != nil)
++		done <- result{s, e}
++	}()
++	select {
++	case <-ctx.Done():
++		p.Close()
++		return Reply{}, ctx.Err()
++	case v := <-done:
++		return v.s, v.e
++	}
++}
++
++func (p *Pipe) readLine(ctx context.Context) ([]byte, error) {
++	if p.lines == nil {
++		return p.reader.ReadSlice('\n')
++	}
++	select {
++	case <-ctx.Done():
++		return nil, ctx.Err()
++	case line, ok := <-p.lines:
++		if !ok {
++			return nil, io.EOF
++		}
++		return line, nil
++	}
++}
+diff --git a/core/umh/pipe_test.go b/core/umh/pipe_test.go
+new file mode 100644
+index 0000000..7cfc9fd
+--- /dev/null
++++ b/core/umh/pipe_test.go
+@@ -0,0 +1,104 @@
++package umh
++
++import (
++	"bufio"
++	"context"
++	"encoding/json"
++	"io"
++	"os"
++	"strings"
++	"testing"
++	"time"
++)
++
++func TestPipeSequence(t *testing.T) {
++	inR, inW, _ := os.Pipe()
++	outR, outW, _ := os.Pipe()
++	defer inW.Close()
++	defer outR.Close()
++	defer outW.Close()
++	p := NewPipe(inR, outW)
++	defer p.Close()
++	requests := bufio.NewReader(outR)
++	seen := map[string]bool{}
++	for _, field := range []string{"phone", "code", "password"} {
++		done := make(chan error, 1)
++		go func() {
++			s, e := p.Ask(context.Background(), field)
++			if e == nil && s != "秘密synthetic" {
++				e = io.ErrUnexpectedEOF
++			}
++			done <- e
++		}()
++		line, _ := requests.ReadBytes('\n')
++		var event map[string]any
++		json.Unmarshal(line, &event)
++		id, _ := event["promptId"].(string)
++		if len(id) < 32 || seen[id] || event["field"] != field || strings.Contains(string(line), "synthetic") {
++			t.Fatal("invalid prompt")
++		}
++		seen[id] = true
++		if field != "phone" && event["inputType"] != "password" {
++			t.Fatal("secret UI not masked")
++		}
++		b, _ := json.Marshal(map[string]string{"promptId": id, "text": "秘密synthetic"})
++		b = append(b, '\n')
++		for _, c := range b {
++			inW.Write([]byte{c})
++		}
++		if e := <-done; e != nil {
++			t.Fatal(e)
++		}
++	}
++}
++func TestPipeRejects(t *testing.T) {
++	for _, mode := range []string{"stale", "eof", "control", "oversized", "duplicate", "invalidutf8", "early", "cancel"} {
++		t.Run(mode, func(t *testing.T) {
++			r, w, _ := os.Pipe()
++			or, ow, _ := os.Pipe()
++			defer w.Close()
++			defer or.Close()
++			defer ow.Close()
++			p := NewPipe(r, ow)
++			defer p.Close()
++			ctx, cancel := context.WithCancel(context.Background())
++			defer cancel()
++			done := make(chan error, 1)
++			go func() { _, e := p.Ask(ctx, "password"); done <- e }()
++			line, _ := bufio.NewReader(or).ReadBytes('\n')
++			var event map[string]any
++			json.Unmarshal(line, &event)
++			id := event["promptId"].(string)
++			switch mode {
++			case "cancel":
++				cancel()
++			case "eof":
++				w.Close()
++			case "oversized":
++				go func() { w.Write([]byte(strings.Repeat("x", 65537) + "\n")) }()
++			case "invalidutf8":
++				w.Write([]byte{255, '\n'})
++			case "duplicate":
++				w.Write([]byte(`{"promptId":"` + id + `","text":"a","text":"b"}` + "\n"))
++			default:
++				text := "synthetic-secret"
++				if mode == "stale" || mode == "early" {
++					id = "wrong"
++				}
++				if mode == "control" {
++					text = "bad\x00secret"
++				}
++				b, _ := json.Marshal(map[string]string{"promptId": id, "text": text})
++				w.Write(append(b, '\n'))
++			}
++			select {
++			case e := <-done:
++				if e == nil || strings.Contains(e.Error(), "secret") {
++					t.Fatal("unsafe error")
++				}
++			case <-time.After(time.Second):
++				t.Fatal("did not stop")
++			}
++		})
++	}
++}
+diff --git a/core/umh/strict.go b/core/umh/strict.go
+new file mode 100644
+index 0000000..94735aa
+--- /dev/null
++++ b/core/umh/strict.go
+@@ -0,0 +1,198 @@
++// UMH additions to tdl v0.20.4; licensed under the upstream AGPL-3.0.
++package umh
++
++import (
++	"context"
++	"encoding/json"
++	"errors"
++	"io"
++	"strconv"
++	"strings"
++	"unicode/utf8"
++)
++
++const MaxSelectedBytes = 16 << 20
++const MaxMessages = 100000
++
++var ErrInput = errors.New("invalid_input")
++
++func Kind(k string) bool { return k == "user" || k == "chat" || k == "channel" }
++func PositiveID(s string, bits int) (int64, error) {
++	if len(s) == 0 || s[0] < '1' || s[0] > '9' {
++		return 0, ErrInput
++	}
++	for _, c := range s {
++		if c < '0' || c > '9' {
++			return 0, ErrInput
++		}
++	}
++	n, e := strconv.ParseInt(s, 10, bits)
++	if e != nil {
++		return 0, ErrInput
++	}
++	return n, nil
++}
++
++// Object reads one object, rejecting duplicate keys before normal JSON decoding.
++func Object(d *json.Decoder, allowed map[string]bool) (map[string]json.RawMessage, error) {
++	tok, e := d.Token()
++	if e != nil || tok != json.Delim('{') {
++		return nil, ErrInput
++	}
++	m := map[string]json.RawMessage{}
++	for d.More() {
++		tok, e = d.Token()
++		k, ok := tok.(string)
++		if e != nil || !ok || !allowed[k] {
++			return nil, ErrInput
++		}
++		if _, exists := m[k]; exists {
++			return nil, ErrInput
++		}
++		var v json.RawMessage
++		if d.Decode(&v) != nil || !utf8.Valid(v) {
++			return nil, ErrInput
++		}
++		m[k] = v
++	}
++	tok, e = d.Token()
++	if e != nil || tok != json.Delim('}') {
++		return nil, ErrInput
++	}
++	return m, nil
++}
++func End(d *json.Decoder) bool { var x any; return d.Decode(&x) == io.EOF }
++
++type Selected struct {
++	ID       json.Number
++	PeerType string
++	Messages []int
++}
++
++func ParseSelected(ctx context.Context, r io.Reader) (Selected, error) {
++	var out Selected
++	// Bound total input even for one huge JSON token, then iterate message entries.
++	lr := &io.LimitedReader{R: r, N: MaxSelectedBytes + 1}
++	d := json.NewDecoder(lr)
++	d.UseNumber()
++	tok, e := d.Token()
++	if e != nil || tok != json.Delim('{') {
++		return out, ErrInput
++	}
++	seen := map[string]bool{}
++	ids := map[int]bool{}
++	for d.More() {
++		if ctx.Err() != nil {
++			return out, ctx.Err()
++		}
++		tok, e = d.Token()
++		k, ok := tok.(string)
++		if e != nil || !ok || seen[k] {
++			return out, ErrInput
++		}
++		seen[k] = true
++		switch k {
++		case "id":
++			tok, e = d.Token()
++			n, ok := tok.(json.Number)
++			if e != nil || !ok {
++				return out, ErrInput
++			}
++			if _, e = PositiveID(n.String(), 64); e != nil {
++				return out, e
++			}
++			out.ID = n
++		case "peer_type":
++			if d.Decode(&out.PeerType) != nil || !Kind(out.PeerType) {
++				return out, ErrInput
++			}
++		case "messages":
++			tok, e = d.Token()
++			if e != nil || tok != json.Delim('[') {
++				return out, ErrInput
++			}
++			for d.More() {
++				if ctx.Err() != nil {
++					return out, ctx.Err()
++				}
++				if len(out.Messages) >= MaxMessages {
++					return out, ErrInput
++				}
++				m, e := Object(d, map[string]bool{"id": true, "type": true, "file": true, "photo": true})
++				if e != nil {
++					return out, e
++				}
++				id, e := PositiveID(string(m["id"]), 32)
++				if e != nil || ids[int(id)] {
++					return out, ErrInput
++				}
++				var typ, file, photo string
++				if json.Unmarshal(m["type"], &typ) != nil || typ != "message" {
++					return out, ErrInput
++				}
++				if v, ok := m["file"]; ok && json.Unmarshal(v, &file) != nil {
++					return out, ErrInput
++				}
++				if v, ok := m["photo"]; ok && json.Unmarshal(v, &photo) != nil {
++					return out, ErrInput
++				}
++				if file == "" && photo == "" {
++					return out, ErrInput
++				}
++				ids[int(id)] = true
++				out.Messages = append(out.Messages, int(id))
++			}
++			tok, e = d.Token()
++			if e != nil || tok != json.Delim(']') {
++				return out, ErrInput
++			}
++		default:
++			return out, ErrInput
++		}
++	}
++	tok, e = d.Token()
++	if e != nil || tok != json.Delim('}') || !End(d) || lr.N <= 0 || !seen["messages"] || out.ID == "" || !Kind(out.PeerType) {
++		return out, ErrInput
++	}
++	return out, nil
++}
++
++func response(b []byte, nonce string) (string, error) {
++	if !utf8.Valid(b) {
++		return "", ErrInput
++	}
++	d := json.NewDecoder(strings.NewReader(string(b)))
++	m, e := Object(d, map[string]bool{"promptId": true, "text": true})
++	if e != nil || !End(d) {
++		return "", ErrInput
++	}
++	var id, s string
++	if json.Unmarshal(m["promptId"], &id) != nil || id != nonce || json.Unmarshal(m["text"], &s) != nil || s == "" || utf8.RuneCountInString(s) > 4096 {
++		return "", ErrInput
++	}
++	for _, c := range s {
++		if c < 32 || c == 127 || c == utf8.RuneError {
++			return "", ErrInput
++		}
++	}
++	return s, nil
++}
++
++func promptResponse(b []byte, nonce string, allowResend bool) (Reply, error) {
++	if allowResend && utf8.Valid(b) {
++		d := json.NewDecoder(strings.NewReader(string(b)))
++		m, e := Object(d, map[string]bool{"promptId": true, "action": true, "text": true})
++		if e != nil || !End(d) {
++			return Reply{}, ErrInput
++		}
++		if _, ok := m["action"]; ok {
++			var id, action string
++			if len(m) != 2 || json.Unmarshal(m["promptId"], &id) != nil || id != nonce || json.Unmarshal(m["action"], &action) != nil || action != "resend" {
++				return Reply{}, ErrInput
++			}
++			return Reply{Resend: true}, nil
++		}
++	}
++	text, e := response(b, nonce)
++	return Reply{Text: text}, e
++}
+diff --git a/core/umh/strict_test.go b/core/umh/strict_test.go
+new file mode 100644
+index 0000000..aaf91c3
+--- /dev/null
++++ b/core/umh/strict_test.go
+@@ -0,0 +1,48 @@
++package umh
++
++import (
++	"context"
++	"strings"
++	"testing"
++)
++
++func TestSelectedLossless(t *testing.T) {
++	for _, id := range []string{"9007199254740993", "9223372036854775807"} {
++		v, e := ParseSelected(context.Background(), strings.NewReader(`{"messages":[{"id":2147483647,"type":"message","file":"x"}],"id":`+id+`,"peer_type":"channel"}`))
++		if e != nil || v.ID.String() != id || len(v.Messages) != 1 || v.Messages[0] != 2147483647 {
++			t.Fatalf("lossless failed: %v", e)
++		}
++	}
++}
++func TestSelectedRejects(t *testing.T) {
++	for _, src := range []string{
++		`{"id":1,"messages":[]}`, `{"id":1,"peer_type":"wat","messages":[]}`,
++		`{"id":1,"id":2,"peer_type":"user","messages":[]}`,
++		`{"id":1e2,"peer_type":"user","messages":[]}`,
++		`{"id":1.0,"peer_type":"user","messages":[]}`,
++		`{"id":-1,"peer_type":"user","messages":[]}`,
++		`{"id":"1","peer_type":"user","messages":[]}`,
++		`{"id":9223372036854775808,"peer_type":"user","messages":[]}`,
++		`{"id":1,"peer_type":"user","messages":[{"id":0,"type":"message","file":"x"}]}`,
++		`{"id":1,"peer_type":"user","messages":[{"id":2147483648,"type":"message","file":"x"}]}`,
++		`{"id":1,"peer_type":"user","messages":[{"id":1,"id":2,"type":"message","file":"x"}]}`,
++		`{"id":1,"peer_type":"user","messages":[{"id":1,"type":"service","file":"x"}]}`,
++		`{"id":1,"peer_type":"user","messages":[{"id":1,"type":"message","file":"x"},{"id":1,"type":"message","file":"x"}]}`,
++		`{"id":1,"peer_type":"user","messages":[]`,
++		`{"id":1,"peer_type":"user","messages":[]} {}`,
++	} {
++		if _, e := ParseSelected(context.Background(), strings.NewReader(src)); e == nil {
++			t.Errorf("accepted malformed fixture %s", src)
++		}
++	}
++}
++func TestSelectedBoundedCanceled(t *testing.T) {
++	if _, e := ParseSelected(context.Background(), strings.NewReader(strings.Repeat(" ", MaxSelectedBytes+1))); e == nil {
++		t.Fatal("unbounded")
++	}
++	c, cancel := context.WithCancel(context.Background())
++	cancel()
++	if _, e := ParseSelected(c, strings.NewReader(`{"id":1,"peer_type":"user","messages":[]}`)); e == nil {
++		t.Fatal("ignored cancel")
++	}
++}
+diff --git a/core/util/tutil/typed.go b/core/util/tutil/typed.go
+new file mode 100644
+index 0000000..0ef2f89
+--- /dev/null
++++ b/core/util/tutil/typed.go
+@@ -0,0 +1,61 @@
++// UMH additions to tdl v0.20.4; licensed under the upstream AGPL-3.0.
++package tutil
++
++import (
++	"context"
++	"fmt"
++	"github.com/gotd/td/telegram/peers"
++	"github.com/gotd/td/tg"
++	"github.com/iyear/tdl/core/umh"
++)
++
++type TypedResolver interface {
++	ResolveUserID(context.Context, int64) (peers.User, error)
++	ResolveChatID(context.Context, int64) (peers.Chat, error)
++	ResolveChannelID(context.Context, int64) (peers.Channel, error)
++}
++
++func ResolveTyped(ctx context.Context, m TypedResolver, kind, idText string) (peers.Peer, error) {
++	id, e := umh.PositiveID(idText, 64)
++	if e != nil || !umh.Kind(kind) {
++		return nil, umh.ErrInput
++	}
++	var p peers.Peer
++	switch kind {
++	case "user":
++		p, e = m.ResolveUserID(ctx, id)
++	case "chat":
++		p, e = m.ResolveChatID(ctx, id)
++	case "channel":
++		p, e = m.ResolveChannelID(ctx, id)
++	}
++	if e != nil {
++		return nil, e
++	}
++	if p == nil || p.ID() != id || InputPeerType(p.InputPeer()) != kind {
++		return nil, umh.ErrInput
++	}
++	return p, nil
++}
++func InputPeerType(p tg.InputPeerClass) string {
++	switch p.(type) {
++	case *tg.InputPeerUser:
++		return "user"
++	case *tg.InputPeerChat:
++		return "chat"
++	case *tg.InputPeerChannel:
++		return "channel"
++	}
++	return ""
++}
++func PeerKey(p tg.PeerClass) string {
++	switch v := p.(type) {
++	case *tg.PeerUser:
++		return fmt.Sprintf("user:%d", v.UserID)
++	case *tg.PeerChat:
++		return fmt.Sprintf("chat:%d", v.ChatID)
++	case *tg.PeerChannel:
++		return fmt.Sprintf("channel:%d", v.ChannelID)
++	}
++	return ""
++}
+diff --git a/core/util/tutil/typed_test.go b/core/util/tutil/typed_test.go
+new file mode 100644
+index 0000000..da03d4b
+--- /dev/null
++++ b/core/util/tutil/typed_test.go
+@@ -0,0 +1,65 @@
++package tutil
++
++import (
++	"context"
++	"errors"
++	"github.com/gotd/td/telegram/peers"
++	"github.com/gotd/td/tg"
++	"testing"
++)
++
++type fakeResolver struct {
++	calls []string
++	fail  bool
++	wrong bool
++	m     *peers.Manager
++}
++
++func (f *fakeResolver) check(k string) error {
++	f.calls = append(f.calls, k)
++	if f.fail {
++		return errors.New("synthetic")
++	}
++	return nil
++}
++func (f *fakeResolver) ResolveUserID(c context.Context, id int64) (peers.User, error) {
++	e := f.check("user")
++	if f.wrong {
++		id++
++	}
++	return f.m.User(&tg.User{ID: id}), e
++}
++func (f *fakeResolver) ResolveChatID(c context.Context, id int64) (peers.Chat, error) {
++	e := f.check("chat")
++	return f.m.Chat(&tg.Chat{ID: id}), e
++}
++func (f *fakeResolver) ResolveChannelID(c context.Context, id int64) (peers.Channel, error) {
++	e := f.check("channel")
++	return f.m.Channel(&tg.Channel{ID: id}), e
++}
++func TestTypedSingleNamespace(t *testing.T) {
++	for _, k := range []string{"user", "chat", "channel"} {
++		for _, fail := range []bool{false, true} {
++			f := &fakeResolver{m: peers.Options{}.Build(nil), fail: fail}
++			p, e := ResolveTyped(context.Background(), f, k, "9007199254740993")
++			if len(f.calls) != 1 || f.calls[0] != k || (e != nil) != fail {
++				t.Fatal("wrong dispatch", f.calls, e)
++			}
++			if !fail && (p.ID() != 9007199254740993 || InputPeerType(p.InputPeer()) != k) {
++				t.Fatal("lost typed identity")
++			}
++		}
++	}
++}
++func TestTypedRejects(t *testing.T) {
++	for _, pair := range [][2]string{{"other", "1"}, {"channel", "-1001"}, {"user", "1e3"}, {"chat", "+1"}, {"chat", "9223372036854775808"}, {"user", ""}} {
++		f := &fakeResolver{m: peers.Options{}.Build(nil)}
++		if _, e := ResolveTyped(context.Background(), f, pair[0], pair[1]); e == nil || len(f.calls) != 0 {
++			t.Fatal("invalid resolver call")
++		}
++	}
++	f := &fakeResolver{m: peers.Options{}.Build(nil), wrong: true}
++	if _, e := ResolveTyped(context.Background(), f, "user", "1"); e == nil {
++		t.Fatal("accepted wrong ID")
++	}
++}
+diff --git a/main.go b/main.go
+index 43244cc..325eee9 100644
+--- a/main.go
++++ b/main.go
+@@ -10,6 +10,7 @@ import (
+ 	"github.com/go-faster/errors"
+ 	"go.etcd.io/bbolt"
+ 
++	"github.com/iyear/tdl/app/login"
+ 	"github.com/iyear/tdl/cmd"
+ )
+ 
+@@ -22,7 +23,14 @@ func main() {
+ 		surveyterm.InterruptErr: "Interrupted",
+ 	}
+ 
+-	if err := cmd.New().ExecuteContext(ctx); err != nil {
++	root := cmd.New()
++	found, _, _ := root.Find(os.Args[1:])
++	machine := cmd.IsMachine(found)
++	if err := root.ExecuteContext(ctx); err != nil {
++		if machine {
++			_ = login.MachineError(os.Stdout, err)
++			os.Exit(1)
++		}
+ 		for e, m := range humanizeErrors {
+ 			if errors.Is(err, e) {
+ 				color.Red("%s", m)
+diff --git a/pkg/consts/umh.go b/pkg/consts/umh.go
+new file mode 100644
+index 0000000..e80b352
+--- /dev/null
++++ b/pkg/consts/umh.go
+@@ -0,0 +1,4 @@
++package consts
++
++// FlagFailOnFloodWait opts application calls into immediate typed rate-limit failure.
++const FlagFailOnFloodWait = "fail-on-flood-wait"
+diff --git a/pkg/tclient/tclient.go b/pkg/tclient/tclient.go
+index 73c7722..ac62434 100644
+--- a/pkg/tclient/tclient.go
++++ b/pkg/tclient/tclient.go
+@@ -19,6 +19,7 @@ type Options struct {
+ 	NTP              string
+ 	ReconnectTimeout time.Duration
+ 	UpdateHandler    telegram.UpdateHandler
++	FailOnFloodWait  bool
+ }
+ 
+ func GetApp(kv storage.Storage) (App, error) {
+@@ -49,5 +50,6 @@ func New(ctx context.Context, o Options, login bool, middlewares ...telegram.Mid
+ 		NTP:              o.NTP,
+ 		ReconnectTimeout: o.ReconnectTimeout,
+ 		UpdateHandler:    o.UpdateHandler,
++		FailOnFloodWait:  o.FailOnFloodWait,
+ 	})
+ }
+diff --git a/pkg/tmessage/strict.go b/pkg/tmessage/strict.go
+new file mode 100644
+index 0000000..5dc47f1
+--- /dev/null
++++ b/pkg/tmessage/strict.go
+@@ -0,0 +1,44 @@
++// UMH additions to tdl v0.20.4; licensed under the upstream AGPL-3.0.
++package tmessage
++
++import (
++	"context"
++	"github.com/gotd/td/telegram/peers"
++	"github.com/gotd/td/tg"
++	"github.com/iyear/tdl/core/dcpool"
++	"github.com/iyear/tdl/core/storage"
++	"github.com/iyear/tdl/core/umh"
++	"github.com/iyear/tdl/core/util/tutil"
++	"io"
++	"os"
++)
++
++func parseStrictFile(ctx context.Context, c *tg.Client, kvd storage.Storage, r io.Reader) (*Dialog, error) {
++	s, e := umh.ParseSelected(ctx, r)
++	if e != nil {
++		return nil, e
++	}
++	m := peers.Options{Storage: storage.NewPeers(kvd)}.Build(c)
++	p, e := tutil.ResolveTyped(ctx, m, s.PeerType, s.ID.String())
++	if e != nil {
++		return nil, e
++	}
++	return &Dialog{Peer: p.InputPeer(), Messages: s.Messages}, nil
++}
++func FromStrictFile(ctx context.Context, pool dcpool.Pool, kvd storage.Storage, files []string) ParseSource {
++	return func() ([]*Dialog, error) {
++		if len(files) != 1 {
++			return nil, umh.ErrInput
++		}
++		f, e := os.Open(files[0])
++		if e != nil {
++			return nil, e
++		}
++		defer f.Close()
++		d, e := parseStrictFile(ctx, pool.Default(ctx), kvd, f)
++		if e != nil {
++			return nil, e
++		}
++		return []*Dialog{d}, nil
++	}
++}
+diff --git a/pkg/tmessage/strict_test.go b/pkg/tmessage/strict_test.go
+new file mode 100644
+index 0000000..20bfa98
+--- /dev/null
++++ b/pkg/tmessage/strict_test.go
+@@ -0,0 +1,19 @@
++package tmessage
++
++import (
++	"context"
++	"github.com/iyear/tdl/core/umh"
++	"strings"
++	"testing"
++)
++
++func TestStrictFileUsesValidatedSelection(t *testing.T) {
++	s, e := umh.ParseSelected(context.Background(), strings.NewReader(`{"id":9007199254740993,"peer_type":"chat","messages":[{"id":7,"type":"message","file":"x"},{"id":9,"type":"message","file":"y"}]}`))
++	if e != nil || len(s.Messages) != 2 || s.Messages[0] != 7 || s.Messages[1] != 9 {
++		t.Fatal("selection changed")
++	}
++	// Missing type fails before a resolver/client could be invoked.
++	if _, e := parseStrictFile(context.Background(), nil, nil, strings.NewReader(`{"id":1,"messages":[]}`)); e == nil {
++		t.Fatal("missing type accepted")
++	}
++}

@@ -1,0 +1,8 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType><TargetFramework>net10.0-windows</TargetFramework><UseWPF>true</UseWPF>
+    <AssemblyName>UnifiedMediaHub</AssemblyName><RootNamespace>UnifiedMediaHub.App</RootNamespace>
+    <StartupObject>UnifiedMediaHub.App.Program</StartupObject><ApplicationManifest>app.manifest</ApplicationManifest>
+  </PropertyGroup>
+  <ItemGroup><ProjectReference Include="../UnifiedMediaHub.Core/UnifiedMediaHub.Core.csproj" /></ItemGroup>
+</Project>

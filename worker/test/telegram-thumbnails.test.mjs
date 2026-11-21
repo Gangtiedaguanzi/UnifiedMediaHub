@@ -1,0 +1,30 @@
+import './fixtures/offline-network.mjs';
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {createHash} from 'node:crypto';
+import {mkdtemp,rm,readFile} from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+const t=await import('../src/shared/telegram-thumbnails.mjs').catch(()=>({}));
+test('Telegram stripped public fixture expands exact JPEG and cached PNG passes actual decoder',async ctx=>{
+  assert.equal(typeof t.thumbnailCandidate,'function');
+  const jpeg=t.thumbnailCandidate({Media:{Photo:{Sizes:[{Type:'i',Bytes:'AQ4oo54FJnilA4600jFABn2FGaTijigAooooAw=='}]}}});
+  assert.equal(jpeg.bytes.length,650);
+  assert.equal(createHash('sha256').update(jpeg.bytes).digest('hex'),'a3c4ff73ba1ddd11599c823b448146d5e32e9429d04108ec7efafeccea100227');
+  assert.equal(jpeg.bytes[164],14); assert.equal(jpeg.bytes[166],40);
+  const png=await readFile(new URL('./fixtures/synthetic-blue.png',import.meta.url));
+  const cached=t.thumbnailCandidate({Media:{Document:{Thumbs:[{Type:'s',Bytes:png.toString('base64')}]}}});
+  assert.deepEqual(cached.bytes,png);
+  const root=await mkdtemp(path.join(os.tmpdir(),'umh-thumb-'));ctx.after(()=>rm(root,{recursive:true,force:true}));
+  const results=await t.decodeThumbnails([jpeg,cached],{root});
+  assert.match(results[0],/^data:image\/jpeg;base64,/); assert.match(results[1],/^data:image\/png;base64,/);
+});
+test('Telegram missing malformed oversized vector and corrupt inline previews become placeholders',async ctx=>{
+  assert.equal(typeof t.thumbnailCandidate,'function');
+  for(const Bytes of [null,'!bad','AQAA','AQ4o',Buffer.alloc(25000,1).toString('base64')]) assert.equal(t.thumbnailCandidate({Media:{Photo:{Sizes:[{Type:'i',Bytes}]}}}),null);
+  assert.equal(t.thumbnailCandidate({Media:{Photo:{Sizes:[{Type:'j',Bytes:'AQ4oAAAA'}]}}}),null);
+  const png=await readFile(new URL('./fixtures/synthetic-blue.png',import.meta.url));
+  const bad=t.thumbnailCandidate({Media:{Photo:{Sizes:[{Type:'s',Bytes:png.subarray(0,33).toString('base64')}]}}});
+  const root=await mkdtemp(path.join(os.tmpdir(),'umh-thumb-'));ctx.after(()=>rm(root,{recursive:true,force:true}));
+  assert.deepEqual(await t.decodeThumbnails([bad],{root}),[null]);
+});
